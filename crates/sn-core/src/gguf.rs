@@ -455,6 +455,13 @@ impl Gguf {
         &self.map.as_bytes()[start..start + t.size as usize]
     }
 
+    /// The whole tensor data section: everything from `data_start` to the end of the file. Loading
+    /// a model on a device is one allocation and one copy of exactly this range, with each tensor at
+    /// `base + (offset - data_start)` (see `sn-hip::Substrate::upload_weights`).
+    pub fn data_section(&self) -> &[u8] {
+        &self.map.as_bytes()[self.data_start as usize..]
+    }
+
     pub fn tensor_f32s<'a>(&'a self, t: &TensorInfo) -> Result<&'a [f32]> {
         if t.ty != ty::F32 {
             return Err(Error::msg(format!("tensor {}: expected f32, got {}", t.name, qtypes::name(t.ty))));

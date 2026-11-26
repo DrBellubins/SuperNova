@@ -12,7 +12,8 @@ use crate::dq::{f16_round, Mat};
 use crate::error::{Error, Result};
 use crate::gguf::Gguf;
 use crate::num::{
-    apply_rope, l2_norm, rms_norm, rms_norm_w, silu, sigmoid, softplus, sinkhorn_sweeps, Rope,
+    apply_rope, l2_norm, rms_norm, rms_norm_w, silu, sigmoid, softplus, sinkhorn_sweeps,
+    Rope, RopePairing,
 };
 use crate::plan::{Exec, Plan};
 use crate::qtypes;
@@ -101,6 +102,10 @@ pub struct RefModel<'a> {
     /// Store the attention K/V cache in f16 (rounded on write) as the reference's default
     /// `cache_type_k/v` does. See `set_kv_f16`.
     kv_f16: bool,
+    /// Round the attention score operands (Q, and K/V through the f16 cache) the way the
+    /// reference's flash-attention path does. See `set_attn_f16`.
+    attn_f16: bool,
+    rope_pairing: crate::num::RopePairing,
 }
 
 impl<'a> RefModel<'a> {
@@ -136,6 +141,16 @@ impl<'a> RefModel<'a> {
             f16w: false,
             f16a: false,
             kv_f16: false,
+            attn_f16: false,
+            // The reference chooses the rope *pair layout* by architecture, not from metadata:
+            // `llama_model_rope_type` returns IMROPE for sensenova_loop (llama-model.cpp:3867) and
+            // the rope op then rotates `(i, i + n_rot/2)` pairs. Adjacent pairs would be identical
+            // at position 0 and wrong everywhere else - see `num::RopePairing`.
+            rope_pairing: if plan.hp.arch == "sensenova_loop" {
+                RopePairing::HalfOffset
+            } else {
+                RopePairing::Adjacent
+            },
         })
     }
 
@@ -168,6 +183,31 @@ impl<'a> RefModel<'a> {
     /// grows with the number of cached tokens. `Tools/golden-check.py` measures both ways.
     pub fn set_kv_f16(&mut self, on: bool) {
         self.kv_f16 = on;
+    }
+
+    /// Reproduce the operand precision of the reference's *score path*, which is not §2's math:
+    /// flash attention is on by default (`llama_context_default_params().flash_attn_type == AUTO`
+    /// and `llama-context.cpp:322` maps AUTO to "on"), and the CPU implementation of
+    /// `ggml_flash_attn_ext` converts Q to the K cache's `vec_dot_type` - f16 for an f16 cache -
+    /// and reads K/V straight out of that f16 cache (`ops.cpp:8850-8946`: `q_to_vec_dot(pq, Q_q,
+    /// DK)`, then `kq_vec_dot(..., k_data, Q_q)`, then `ggml_vec_mad_f16_f32(.., v_data, vs)`).
+    /// So every score the reference forms is built from f16-rounded operands with f32 accumulation.
+    /// `Tools/attn-probe.c` measures that operand budget against the same op with f32 operands.
+    /// Implies `kv_f16`, because the f16 K/V rounding comes for free with the cache.
+    /// Diagnostic only: rotate adjacent `(2p, 2p+1)` pairs instead of the `(p, p + n_rot/2)` pairs
+    /// this architecture uses. It reproduces the defect `Docs/numerics.md` §3 describes, so the
+    /// measurement that found it stays repeatable (`Tools/position-check.py`).
+    pub fn set_rope_adjacent(&mut self, on: bool) {
+        if on {
+            self.rope_pairing = crate::num::RopePairing::Adjacent;
+        }
+    }
+
+    pub fn set_attn_f16(&mut self, on: bool) {
+        self.attn_f16 = on;
+        if on {
+            self.kv_f16 = true;
+        }
     }
 
     pub fn clear(&mut self) {
@@ -346,20 +386,28 @@ impl<'a> RefModel<'a> {
 
         // Per-head Q/K norm, then rope over the first `n_rot` dimensions only. The second half of
         // each head block is the output gate and is never rotated.
+        let attn_f16 = self.attn_f16;
+        let pairing = self.rope_pairing;
         let (cos, sin) = self.rope.table(pos);
         let mut q = vec![0.0f32; qg.len()];
         for h in 0..n_h {
             let src = &qg[h * hstride..h * hstride + dh];
             let dst = &mut q[h * hstride..h * hstride + dh];
             rms_norm_w(src, eps, &qn, dst);
-            apply_rope(dst, &cos, &sin);
+            apply_rope(dst, &cos, &sin, pairing);
+            if attn_f16 {
+                // the reference converts Q to f16 here, i.e. after the norm and the rotation
+                for v in dst.iter_mut() {
+                    *v = f16_round(*v);
+                }
+            }
         }
         for h in 0..n_kvh {
             let range = h * dh..h * dh + dh;
             let hk = &k[range.clone()];
             let mut tmp = vec![0.0f32; hk.len()];
             rms_norm_w(hk, eps, &kn, &mut tmp);
-            apply_rope(&mut tmp, &cos, &sin);
+            apply_rope(&mut tmp, &cos, &sin, pairing);
             k[range].copy_from_slice(&tmp);
         }
 

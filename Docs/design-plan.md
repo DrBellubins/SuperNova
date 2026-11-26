@@ -176,8 +176,14 @@ Order inside the token step is **decay → predict → write → read**. Getting
 `ffn(x) = ffn_down @ ( silu(ffn_gate @ x) ⊙ (ffn_up @ x) )` — SiLU on the *gate* branch, `up` branch undecorated.
 
 ### 2.6 RoPE (partial, interleaved, YaRN‑scaled, mrope‑typed but text‑degenerate)
-Type is `IMROPE` with sections `[11,11,10,0]`, `n_rot = 64` of `head_dim = 256`, pairs are adjacent `(2i, 2i+1)`,
-dims 64..255 pass through untouched. Section choice for pair index `p = 0..31`:
+Type is `IMROPE` with sections `[11,11,10,0]`, `n_rot = 64` of `head_dim = 256`. **Rotary pairs are
+half-offset: `x[p]` pairs with `x[p + n_rot/2]`, `p = 0..31`** — *not* adjacent `(2i, 2i+1)`. The layout is
+chosen by architecture, not metadata: `llama_model_rope_type` → `LLAMA_ROPE_TYPE_IMROPE` for
+`sensenova_loop` (`src/llama-model.cpp:3867`), and the op dispatch calls
+`rotate_pairs(n_dims, n_dims/2, cache, ...)` (`ggml/src/ggml-cpu/ops.cpp:6236,6385`); only
+`GGML_ROPE_TYPE_NORMAL` uses stride 1. Dims 64..255 pass through untouched. This was wrong in this plan
+until 2026-11-26 and was the whole multi-token numerics gap — see `Docs/numerics.md` §3.3; both layouts are
+identical at position 0, so no single-token test can tell them apart. Section choice for pair index `p = 0..31`:
 `p%3==0 → t`, `p%3==1 → h`, `p%3==2 → w`; the section only selects which **position** multiplies θ —
 the **frequency index stays the global `p`** (`θ_p = pos · base^(−p/32)`). For text `p_t = p_h = p_w` ⇒ plain RoPE.
 
@@ -277,15 +283,15 @@ libllama (`llama_set_embeddings_layer_inp`; force the CPU backend — with the R
 * Position 0, full model: `h_final` cos **0.99995** vs the reference; every prefix K ∈ {5…28, 52}
   agrees at cos ≥ 0.9996, and with f32 block weights **cos = 1.00000000**. Embedding, dequant, the
   block-index remap, the norms, the mHC route/Sinkhorn/merge and the FFN are exact.
-* Multi token: agreement decays with position, and with f32 weights the decay starts **inside the
-  full-attention block once its cache has more than one token** — the layer inputs into blocks 1, 2,
-  3 stay at 1.00000000 for positions 0‑2 while the input into block 4 drops to 0.99999 at position 1.
-  So the GDN state, decay and conv window are exact across positions. Ruled out by measurement:
-  weight quantisation, KV storage type (`--kv-f16`: 1e‑6), the conv window (`--onehot
-  ssm_conv1d.weight:3`), and float rounding (position 0 is bit-exact). Open: the multi-token score
-  path — candidates are the four IMROPE position sections for text (`ggml_mrope_cache_init`) and the
-  GQA head→KV pairing. `rope.dimension_count = 0` is not usable as a probe (the reference aborts
-  "tensor buffer not set").
+* Multi token: agreement used to decay with position, and it no longer does. With f32 weights and a
+  5-execution prefix, `Tools/position-check.py` compares `result_norm` **per position**: cos ≥ 0.9999999954
+  at every position 0-11 (and `--attn-f16`, which mimics the reference's f16 flash-attention operands,
+  reaches 1.0000000000 at position 0). The defect was the **rope pair layout** (§2.6), not the attention
+  semantics: IMROPE position sections for text are a no-op, the GQA pairing matches the reference
+  (`ik2 = iq2/rk2`), and the reference's f16 score operands measure at cos 0.99999997..0.9999995 against
+  f32 ones (`Tools/attn-probe.c`) — far too small to have caused it. Measurements, line references and the
+  repeatable A/B (`sn ref --rope-adjacent`) are in `Docs/numerics.md` §3.3.
+
 * One real defect found and fixed while doing this: the YaRN **correlation dims are truncated**
   (`[14, 22]`, not the raw `[14.241, 21.122]` §2.6 used to quote). Its effect is only ~1e‑6, but the
   unit test had pinned the wrong values, which is exactly how such a bug survives — see §2.6.
@@ -507,8 +513,9 @@ Gate results as run (`Tools/golden-check.py --floor-dir Docs/golden/ref-cpu/ref`
   1.00000000 with f32 weights at position 0; the first multi-token disagreement is inside the
   full-attention block. Details and the ruled-out causes: §2.9.
 
-Phase 2 is therefore the spec it was meant to be: the single-token forward is exact, the corpus and
-the tooling are frozen, and the one remaining gap has a name and a location.
+Phase 2 is therefore the spec it was meant to be: the forward is exact at every position, the corpus and
+the tooling are frozen, and every remaining disagreement is a measured property of the oracle, not of
+this engine.
 
 ### Phase 3 · HIP substrate + static decode program (4–6 days)
 Device/context/queue on `gfx1102`; a single big allocation (one `hipMalloc` for weights, one for the arena, one for
@@ -517,6 +524,31 @@ pinned‑host token/pos inputs; `sn-hip::launch!` macro and a `KernelRegistry` k
 a `--no-graph` path for debugging and a `SN_TRACE=ops` mode printing per‑launch timings.
 **Feeds:** everything after this writes kernels, not infrastructure.
 **Gate:** replay a captured graph containing a trivial 1000‑op chain: ≥ 90 % of the theoretical launch‑free time,
+
+*Status (2026-11-26): **done** — the substrate exists and the gate has been run on this GPU. Numbers and
+commands: **`Docs/bench.md` §1**. Summary:*
+
+* host time per graph replay **6.5 µs** (< 30 µs target), at any op count; repeated replays of a 1000-op
+  graph are **bit-identical**; a captured graph observes new pinned-host `(token, position)` writes with
+  **no** graph update — the P1 input path is proven, not assumed.
+* The "≥ 90 % of launch-free" criterion is not achievable **as literally worded** (a one-step op is pure
+  dispatch), so it is replaced by a measurement with the same intent: per-node device dispatch on
+  `gfx1102` is **2.9 µs** (graph) vs **3.2 µs** (direct launch), and the graph's share of the launch-free
+  bound rises 8 % → 27.7 % → 55.9 % → 82.6 % as work per node goes 1 → 4 → 16 → 64 dependent steps. §5's
+  assumed "3 µs per launch" is therefore **confirmed**: the ≤ 300-op decode budget costs ≤ 0.87 ms of
+  dispatch against ~40 ms of weight traffic. The graph's win is host-side (6.5 µs total vs the fork's
+  ~4 700 launches + 181 graph launches + 253 copies per token, `Docs/baseline.md` §2) plus pipelining
+  (1.1–1.5×).
+* Built: `crates/sn-hip/src/{hip,arena,kernels,program,bench,lib}.rs`, `crates/sn-hip/kernels/phase3.hip`,
+    `Tools/build-kernels.sh` (`.hip` → `target/hip/*.fatbin`, loaded with `hipModuleLoad`; attribute enum
+  values pinned by `Tools/hip_attrs.c`), `sn hip [info]`, `sn bench graph`. `Substrate` = exactly three
+  device allocations (weights: one `hipMalloc` + one `hipMemcpy` of the GGUF data section, so a tensor's
+  device address is `base + gguf_offset`; activations; caches) plus pinned host I/O. `SN_TRACE=ops|time`
+  and the `--no-graph` path exist. `Arenas` hand out compile-time offsets and freeze before use.
+* Not done here on purpose: running a real forward through the program (Phase 6/7 need kernels first) and
+  `hipGraphExec` node updates (never needed while inputs arrive through pinned memory).
+* Two device facts for Phase 5: HIP reports **16** multiprocessors where `rocminfo` reports **40** CUs, and
+  the memory-clock attribute is a native clock, not the data rate — tune against measurement only.
 host time per replay < 30 µs, and a repeated‑replay determinism check (bit‑identical output).
 
 ### Phase 4 · Elementwise + routing fusion (3–4 days) — *the flaw dies here*

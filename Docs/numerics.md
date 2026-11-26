@@ -21,7 +21,7 @@ measurement with a command line behind it, not an assertion.
 | mHC route: **one** unweighted RMS over the concatenated `2d`, 8 logits, `in = a·σ(ℓ0)+b·σ(ℓ1)` scaled by `pre_scale`, `post = 2σ(ℓ2),2σ(ℓ3)`, `mix = ℓ4..ℓ7` | `forward::route` | `sensenova-loop.cpp:105-146` |
 | balancing: **exactly `mhc.iterations` (20)** sweeps of pairs (0,1),(2,3),(0,2),(1,3), pair update `δ=x−y; x←−softplus(−δ); y←−softplus(δ)`, then **`exp()` after the last sweep** | `num::sinkhorn_sweeps`, `forward::route` | `num::tests::twenty_sweeps_are_pinned_and_six_are_different`; the merged mix matrices are doubly stochastic after 20 sweeps |
 | merge uses the **pre-merge** a,b; `cur = 0.5·(a+b)` is only the exposed value; streams re-seed at every `physical == mhc_start` (i.e. once per loop pass — `sensenova-loop.cpp:174`) | `forward::merge`, `forward::run` | K=5/K=52 agreement |
-| RoPE: partial (first `n_rot=64` of 256), pairs adjacent, YaRN with `freq_scale=1/factor`, `ext_factor=1` because type is yarn, `mscale = attn_factor·(1+0.1·ln(1/freq_scale))` applied to **cos and sin**, IMROPE sections select *which position* multiplies θ while the **frequency index stays the global pair index** (⇒ text collapses to plain RoPE) | `num::Rope` | `rope_yarn` + `ggml_rope_cache_init` + `ggml_mrope_cache_init` (`ggml/src/ggml-cpu/ops.cpp:6122,6147,~6180`); `num::tests::rope_*` |
+| RoPE: partial (first `n_rot=64` of 256), pairs **(p, p + n_rot/2)** — half-offset, not adjacent, YaRN with `freq_scale=1/factor`, `ext_factor=1` because type is yarn, `mscale = attn_factor·(1+0.1·ln(1/freq_scale))` applied to **cos and sin**, IMROPE sections select *which position* multiplies θ while the **frequency index stays the global pair index** (⇒ text collapses to plain RoPE) | `num::Rope` | `rope_yarn` + `ggml_rope_cache_init` + `ggml_mrope_cache_init` (`ggml/src/ggml-cpu/ops.cpp:6122,6147,~6180`); `num::tests::rope_*` |
 | **correlation dims are truncated**: `corr[0]=floor(...)`, `corr[1]=ceil(...)` before clamping (`ggml_rope_yarn_corr_dims`, ggml.c:4377; `ggml_rope_get_truncate` is true unless someone calls `ggml_rope_set_truncate(false)`, which nothing in this fork does) → this checkpoint uses **[14, 22]**, not the raw [14.241, 21.122] §2.6 quotes | `num::Rope::new` | `num::tests::rope_parameters_resolve_to_the_checkpoints_yarn_values` (fixed 2026‑11‑26: the old test pinned the raw values, which is how the bug survived) |
 | weight formats q4_K / q6_k / f32 read byte-exactly | `dq.rs`, `qtypes.rs` | §2.9 (vs `Tools/dequant_ref.py`), `dq::tests::*`, `Tools/stage-check.py` |
 | GGUF block indices are first-visit-logical (`blk.52..55` = physical 28..31) | `plan.rs` | `tests/plan_gates.rs` |
@@ -73,24 +73,67 @@ Results:
    executions; prefix truncations K = 5,6,8,…,28 and K = 52 (blocks 0..27 twice) all agree at
    **cos ≥ 0.9996**, and with `def32` weights cos = **1.00000000**, i.e. the whole non-recursive
    trunk, the mHC routes/merges, the norms, the dequantisers and the block-index remap are exact.
-3. **Multi token**: agreement degrades with position. With f32 weights (`def32.py`, K=5) the per
-   layer-input comparison is:
+3. **Multi token — the open item of 2026-11-26 is closed: the rope *pair layout*.**
+   `Tools/position-check.py` (prefix-truncate → `def32` → compare `result_norm` **per position**)
+   settles it. Same 5-execution prefix, f32 block weights, 12 tokens of `p5-loop-pressure`:
 
-   | layer input | pos 0 | pos 1 | pos 2 |
+   | position | `sn ref` (fixed) | `--rope-adjacent` (the defect) | `--attn-f16` |
    |---|---|---|---|
-   | into block 1 (after GDN 0) | 1.00000000 | 1.00000000 | 1.00000000 |
-   | into block 2, 3 | 1.00000000 | 1.00000000 | 1.00000000 |
-   | **into block 4 (after full-attention 3)** | 1.00000000 | **0.99999212** | **0.99998816** |
+   | 0 | 0.9999999995 | 0.9999999995 | 1.0000000000 |
+   | 1 | 0.9999999988 | 0.9999787001 | 0.9999999991 |
+   | 4 | 0.9999999982 | 0.9999228928 | 0.9999999996 |
+   | 8 | 0.9999999971 | 0.9996215263 | 0.9999999998 |
+   | 11 | 0.9999999960 | 0.9991539387 | 0.9999999988 |
 
-   so the recurrent path (state, decay, conv window, delta rule) is exact across positions, and the
-   first difference appears **inside the full-attention block once it has more than one token in the
-   cache**. Ruled out as the cause by measurement: KV storage (`--kv-f16` changes the worst cos by
-   1e‑6), weight quantisation (`def32` gives the same curve), the conv window (`--onehot
-   ssm_conv1d.weight:3` moves it the wrong way), and float rounding (position 0 is bit-exact).
-   Still open; the remaining candidates are the score path (how the four IMROPE position sections
-   are filled for text, `GGML_ROPE_TYPE_IMROPE` + `ggml_mrope_cache_init`) and the GQA head→KV
-   pairing under the multi-token mask. Note `rope.dimension_count = 0` is not a usable probe: the
-   reference aborts ("tensor buffer not set").
+   ```sh
+   ./Tools/build-kernels.sh   # not needed here; see Docs/bench.md for Phase 3
+   python3 Tools/position-check.py --blocks 5 --tokens 12 --prompt p5-loop-pressure \
+       --variants ",--rope-adjacent,--attn-f16"
+   ```
+
+   **The defect.** `num::apply_rope` rotated adjacent pairs `(2p, 2p+1)`; this checkpoint rotates
+   `(p, p + n_rot/2)`. The pair layout is chosen by **architecture**, not by GGUF metadata:
+   `llama_model_rope_type` returns `LLAMA_ROPE_TYPE_IMROPE` for `general.architecture =
+   sensenova_loop` (`src/llama-model.cpp:3867`), and the rope op's dispatch
+   (`ggml/src/ggml-cpu/ops.cpp:6379-6386`) calls `rotate_pairs(n_dims, n_dims/2, cache, ...)`
+   (`ops.cpp:6236`), i.e. `x[p]` pairs with `x[p + n_rot/2]` while `GGML_ROPE_TYPE_NORMAL`
+   (stride 1) is the adjacent form. The two are **identical at position 0** — there `theta = 0`, so
+   `sin = 0` and `cos = mscale` for every pair, and a rotation is a scale whatever pairing it
+   walks. That is exactly why every §3.2 measurement agreed to `1.00000000` while positions ≥ 1
+   drifted, and it is why "position 0 is bit-exact" is a weak assertion about rope: it constrains
+   `mscale`, nothing else. Pinned by `num::tests::rope_pairing_half_offset_rotates_across_the_half`
+   and `rope_pairings_are_indistinguishable_at_position_zero`; `sn ref --rope-adjacent` reproduces
+   the defect so this measurement stays repeatable.
+
+   **What the two earlier candidates turned out to be.** Neither:
+   * *IMROPE position sections for text* — no effect, as §2.6 already says. `ggml_mrope_cache_init`
+     (`ops.cpp:6164`) selects `theta_t/h/w/e` per pair from `sections = [11,11,10,0]`
+     (`sector = (i0/2) % 32`; every pair 0..31 lands in t/h/w, never in the `e` section), and for a
+     text batch all four position rows are the same value (`p_t = pos[i2]`, `p_h = pos[i2 + ne2]`,
+     …), so it collapses to plain rope with the **global pair index** — which is what we implement.
+     The correlation-dimension ramp *is* evaluated on the pair index: `rope_yarn_ramp` does
+     `(i0 / 2 - low) / (high - low)` (`ops.cpp`), i.e. the reference divides the dimension index by
+     2 itself.
+   * *GQA head→KV pairing* — identical. Ours is `kv_head(h) = h * n_kv / n_head`; the CPU FATT uses
+     `ik2 = iq2 / rk2` with `rk2 = n_head / n_kv` (`ops.cpp:8845-8860`). Also, a wrong pairing is
+     visible at position 0 (each head would read a different `v`), and position 0 was exact.
+   * *The reference's operand precision in the score path* is real but is **not** the gap, and is now
+     measured: flash attention is on by default (`llama_context_default_params().flash_attn_type =
+     LLAMA_FLASH_ATTN_TYPE_AUTO`, and `src/llama-context.cpp:322` maps AUTO to
+     `cparams.flash_attn = true`), so the score path is `ggml_flash_attn_ext(q_f32, k_f16, v_f16,
+     mask_f16)` — the mask must be f16 (`ggml.c:5434` asserts it), and the CPU kernel converts Q to
+     K's `vec_dot_type` (f16 for an f16 cache) at `ops.cpp:8850` before `kq_vec_dot`.
+     `Tools/attn-probe.c` builds that exact op with synthetic inputs against the same op with f32
+     K/V: the whole-row cos is 0.99999997 at neutral (unit-Gaussian) q/k, 0.99999990 at a score std
+     of ~16², and never worse than 0.9999995 — one to two orders of magnitude too small to explain
+     what was seen. `sn ref --attn-f16` reproduces those operands when a closer-than-f32 comparison
+     is wanted (it is the last column above).
+
+   Consequence for the rest of the plan: **f16 attention operands are inside the oracle's own noise
+   budget** (≤1e-7 at the model level here), so Phase 6/8 may compute QK in f16 without moving
+   away from the reference; only the f32 *accumulation* is load-bearing. What is *not* optional is
+   the pair layout, the `1/sqrt(d_head)` scale, and the rope frequency table.
+
 4. **Gate as run today** (`Tools/golden-check.py --floor-dir Docs/golden/ref-cpu/ref`): top‑1
    matches the reference for **5/5** corpus prompts; see `Docs/golden/` and the run log.
 

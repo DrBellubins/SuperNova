@@ -108,15 +108,48 @@ pub fn sinkhorn_sweeps(mix: &mut [f32; 4], sweeps: usize) {
     }
 }
 
-/// Paired (height,width) or single interleaved rope: rotate adjacent pairs `(2p, 2p+1)`.
+/// Which two head dimensions form a rotary pair.
 ///
-/// Only the first `2 * cos.len()` dimensions of `head` are touched; the rest of the head is copied
-/// through unchanged by the caller (this function does not touch them).
-pub fn apply_rope(head: &mut [f32], cos: &[f32], sin: &[f32]) {
-    for (p, (c, s)) in cos.iter().zip(sin.iter()).enumerate() {
-        let (a, b) = (head[2 * p], head[2 * p + 1]);
-        head[2 * p] = a * *c - b * *s;
-        head[2 * p + 1] = b * *c + a * *s;
+/// The reference decides this **by architecture**, not from GGUF metadata: `llama_model_rope_type`
+/// (`src/llama-model.cpp:3677`) returns `LLAMA_ROPE_TYPE_IMROPE` for
+/// `general.architecture = sensenova_loop` (`llama-model.cpp:3867`), and the rope op's dispatch
+/// (`ggml/src/ggml-cpu/ops.cpp:6379-6386`) then calls `rotate_pairs(n_dims, n_dims/2, cache, ...)`
+/// (`ops.cpp:6236`), i.e. the pair is `(i, i + n_rot/2)` - GPT-NeoX style. Only
+/// `GGML_ROPE_TYPE_NORMAL` rotates adjacent `(2p, 2p+1)` pairs.
+///
+/// Both layouts agree exactly at `pos = 0`, where `theta = 0` makes `sin = 0` and `cos = mscale`, so
+/// the bit-exact position-0 agreement of `Docs/numerics.md` §3 could never have told them apart.
+/// This is `Tools/attn-probe`'s finding for the multi-token score path; `num::tests::
+/// rope_pairing_*` pins both layouts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RopePairing {
+    /// `GGML_ROPE_TYPE_NORMAL`: `rotate_pairs(n, 1, ...)`.
+    Adjacent,
+    /// `GGML_ROPE_TYPE_{NEOX,MROPE,IMROPE}`: `rotate_pairs(n, n/2, ...)`.
+    HalfOffset,
+}
+
+/// Rotate the first `2 * cos.len()` dimensions of `head`; the rest of the head is left alone (the
+/// reference fills them from the source in a separate loop, `ops.cpp:6394-6405`).
+pub fn apply_rope(head: &mut [f32], cos: &[f32], sin: &[f32], pairing: RopePairing) {
+    match pairing {
+        RopePairing::Adjacent => {
+            for (p, (c, s)) in cos.iter().zip(sin.iter()).enumerate() {
+                let (a, b) = (head[2 * p], head[2 * p + 1]);
+                head[2 * p] = a * *c - b * *s;
+                head[2 * p + 1] = b * *c + a * *s;
+            }
+        }
+        RopePairing::HalfOffset => {
+            // `rotate_pairs(n, n/2, ...)`: pair index `p` reads cos/sin from cache[2p], cache[2p+1]
+            // (our tables) and rotates head[p] with head[p + n/2].
+            let off = cos.len();
+            for (p, (c, s)) in cos.iter().zip(sin.iter()).enumerate() {
+                let (a, b) = (head[p], head[p + off]);
+                head[p] = a * *c - b * *s;
+                head[p + off] = a * *s + b * *c;
+            }
+        }
     }
 }
 
@@ -452,11 +485,48 @@ mod tests {
             *h = (i as f32) * 0.1 - 3.0;
         }
         let before: f32 = (0..32).map(|p| head[2 * p].powi(2) + head[2 * p + 1].powi(2)).sum();
-        apply_rope(&mut head, &cos, &sin);
+        apply_rope(&mut head, &cos, &sin, RopePairing::HalfOffset);
         let after: f32 = (0..32)
             .map(|p| head[2 * p].powi(2) + head[2 * p + 1].powi(2))
             .sum();
         // mscale scales the whole table, so the pair norms scale by mscale^2.
         assert!((after / before - r.mscale.powi(2)).abs() < 1e-3, "{after} {before}");
+    }
+
+    #[test]
+    fn rope_pairing_half_offset_rotates_across_the_half() {
+        // GGML `rotate_pairs(n, n/2, ...)`: pair p is (p, p + n/2), not (2p, 2p+1). Hand-computed
+        // for n_rot = 4 with theta = (90 deg, 0 deg): head [1,2,3,4] -> [-3, 2, 1, 4].
+        let cos = [0.0f32, 1.0];
+        let sin = [1.0f32, 0.0];
+        let mut h = [1.0f32, 2.0, 3.0, 4.0];
+        apply_rope(&mut h, &cos, &sin, RopePairing::HalfOffset);
+        assert_eq!(h, [-3.0, 2.0, 1.0, 4.0]);
+        let mut g = [1.0f32, 2.0, 3.0, 4.0];
+        apply_rope(&mut g, &cos, &sin, RopePairing::Adjacent);
+        assert_eq!(g, [-2.0, 1.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn rope_pairings_are_indistinguishable_at_position_zero() {
+        // theta = 0 there, so cos = mscale and sin = 0 for every pair: whichever pairing a
+        // checkpoint uses, position 0 is a pure scale. That is why the position-0 agreement of
+        // Docs/numerics.md §3 could never catch a wrong layout, and why the defect only showed up
+        // at positions >= 1, inside the first full-attention block.
+        let r = Rope::new(64, 1e7, &[11, 11, 10, 0], 2.0, 262144);
+        let (cos, sin) = r.table(0);
+        let head: Vec<f32> = (0..64).map(|i| (i as f32) * 0.1 - 3.0).collect();
+        let mut a = head.clone();
+        let mut b = head.clone();
+        apply_rope(&mut a, &cos, &sin, RopePairing::Adjacent);
+        apply_rope(&mut b, &cos, &sin, RopePairing::HalfOffset);
+        assert_eq!(a, b);
+        let scaled: Vec<f32> = head.iter().map(|v| v * r.mscale).collect();
+        assert_eq!(a, scaled.as_slice());
+        // and they are not the same at position 1
+        let (cos1, sin1) = r.table(1);
+        apply_rope(&mut a, &cos1, &sin1, RopePairing::Adjacent);
+        apply_rope(&mut b, &cos1, &sin1, RopePairing::HalfOffset);
+        assert_ne!(a, b);
     }
 }

@@ -24,9 +24,10 @@ usage:
   sn dump --meta <model.gguf>              GGUF metadata
   sn ref --model <model.gguf> (--tokens <id,id,...> | --tokens-file <f>)
          [--dump <dir>] [--dump-only p1,p2] [--iters N] [--limit-exec N] [--threads N] [--top N] [--json]
-         [--logits-out <f>] [--f16-weights] [--f16-acts] [--kv-f16]
+         [--logits-out <f>] [--f16-weights] [--f16-acts] [--kv-f16] [--attn-f16] [--rope-adjacent]
                                              reference forward + logits (Phase 2)
-  sn info                                  build information
+  sn hip [info]                            device, slabs, kernel image (Phase 3)
+  sn bench graph [--ops N] [--reps N]      the Phase 3 graph-replay gate
 
 Token ids come from the reference tokenizer for now (`Tools/tok --ids`); the GGUF BPE tokenizer
 is Phase 10 work (Docs/design-plan.md §7).
@@ -76,6 +77,8 @@ fn run(argv: &[String]) -> sn_core::Result<String> {
             }
         }
         Some("ref") => cmd_ref(argv, &positional, opt_val, flag),
+        Some("hip") => hip::cmd_hip(&positional, opt_val, flag),
+        Some("bench") => hip::cmd_bench(&positional, opt_val),
         Some("deq") => cmd_deq(&positional, opt_val),
         Some(cmd) => Err(sn_core::Error::msg(format!(
             "unknown command '{cmd}' (try: sn --help)"
@@ -191,6 +194,8 @@ fn cmd_ref(
     model.set_limit_exec(limit_exec);
     model.set_f16_operands(flag("--f16-weights"), flag("--f16-acts"));
     model.set_kv_f16(flag("--kv-f16"));
+    model.set_attn_f16(flag("--attn-f16"));
+    model.set_rope_adjacent(flag("--rope-adjacent"));
     let logits = model.run(&tokens, iters, &dump)?;
     let elapsed = t0.elapsed();
 
@@ -639,3 +644,5 @@ fn json_nums<T: std::fmt::Display>(v: &[T]) -> String {
     let parts: Vec<String> = v.iter().map(|x| x.to_string()).collect();
     format!("[{}]", parts.join(", "))
 }
+
+mod hip;

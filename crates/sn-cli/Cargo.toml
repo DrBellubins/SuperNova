@@ -12,3 +12,4 @@ path = "src/main.rs"
 
 [dependencies]
 sn-core = { path = "../sn-core" }
+sn-hip = { path = "../sn-hip" }

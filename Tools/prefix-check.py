@@ -55,10 +55,11 @@ def main():
     ap.add_argument("--model", default=DEF_MODEL)
     ap.add_argument("--tokens", default="Docs/golden/tokens/p1-capital.ids")
     ap.add_argument("--ks", default="5,8,12,16,20,24,28,52")
-    ap.add_argument("--work", default="/tmp/prefix")
+    ap.add_argument("--work", default="/dev/shm/prefix")
     ap.add_argument("--oracle", default=os.path.join(HERE, "sn-oracle"))
     ap.add_argument("--sn", default="./target/release/sn")
     ap.add_argument("--keep-gguf", action="store_true")
+    ap.add_argument("--sn-flags", default="", help="extra flags for `sn ref` (e.g. --attn-f16)")
     ap.add_argument("--all-tokens", action="store_true",
                     help="feed the whole token list instead of only the first id, and report every "
                          "position. Position 0 runs with empty caches, so anything that only shows "
@@ -102,7 +103,8 @@ def main():
             print(f"{k:>4}  reference failed: {rc.stderr.decode().strip().splitlines()[-1:]}")
             continue
         rc = subprocess.run([args.sn, "ref", "--model", gg, "--tokens-file", single,
-                             "--dump", s, "--dump-only", "h_final", "--json"],
+                             "--dump", s, "--dump-only", "h_final", "--json"]
+                            + args.sn_flags.split(),
                             capture_output=True)
         if rc.returncode:
             print(f"{k:>4}  sn ref failed: {rc.stderr.decode().strip().splitlines()[-1:]}")
