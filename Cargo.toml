@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/sn-core", "crates/sn-cli", "crates/sn-hip"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+sn-core = { path = "crates/sn-core" }
+
+[profile.release]
+debug = true
+codegen-units = 1

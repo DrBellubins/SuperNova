@@ -1,0 +1,171 @@
+{
+ "index": 0,
+ "content": " fibonacci",
+ "tokens": [],
+ "id_slot": 2,
+ "stop": true,
+ "model": "/home/justin/Documents/AI/Models/SenseLoop/SenseNova-Loop-9B-Q4_K_M.gguf",
+ "tokens_predicted": 1,
+ "tokens_evaluated": 19,
+ "generation_settings": {
+  "seed": 0,
+  "temperature": 0.0,
+  "dynatemp_range": 0.0,
+  "dynatemp_exponent": 1.0,
+  "top_k": 40,
+  "top_p": 0.949999988079071,
+  "min_p": 0.05000000074505806,
+  "top_n_sigma": -1.0,
+  "xtc_probability": 0.0,
+  "xtc_threshold": 0.10000000149011612,
+  "typical_p": 1.0,
+  "repeat_last_n": 64,
+  "repeat_penalty": 1.0,
+  "presence_penalty": 0.0,
+  "frequency_penalty": 0.0,
+  "dry_multiplier": 0.0,
+  "dry_base": 1.75,
+  "dry_allowed_length": 2,
+  "dry_penalty_last_n": 64,
+  "dry_sequence_breakers": [
+   "\n",
+   ":",
+   "\"",
+   "*"
+  ],
+  "mirostat": 0,
+  "mirostat_tau": 5.0,
+  "mirostat_eta": 0.10000000149011612,
+  "adaptive_target": -1.0,
+  "adaptive_decay": 0.8999999761581421,
+  "stop": [],
+  "max_tokens": 1,
+  "n_predict": 1,
+  "n_keep": 0,
+  "n_discard": 0,
+  "ignore_eos": false,
+  "stream": false,
+  "logit_bias": [],
+  "n_probs": 5,
+  "min_keep": 0,
+  "grammar": "",
+  "grammar_lazy": false,
+  "grammar_triggers": [],
+  "preserved_tokens": [],
+  "chat_format": "Content-only",
+  "reasoning_format": "deepseek",
+  "reasoning_in_content": false,
+  "generation_prompt": "",
+  "samplers": [
+   "penalties",
+   "dry",
+   "top_n_sigma",
+   "top_k",
+   "typ_p",
+   "top_p",
+   "min_p",
+   "xtc",
+   "temperature"
+  ],
+  "speculative.types": "none",
+  "timings_per_token": false,
+  "post_sampling_probs": false,
+  "backend_sampling": false,
+  "lora": []
+ },
+ "prompt": "def fibonacci(n):\n    if n <= 1:\n        return n\n    return",
+ "has_new_line": false,
+ "truncated": false,
+ "stop_type": "limit",
+ "stopping_word": "",
+ "tokens_cached": 19,
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 19,
+  "prompt_ms": 1943.929,
+  "prompt_per_token_ms": 102.31205263157895,
+  "prompt_per_second": 9.774019524375632,
+  "predicted_n": 1,
+  "predicted_ms": 0.001,
+  "predicted_per_token_ms": 0.0,
+  "predicted_per_second": 0.0
+ },
+ "completion_probabilities": [
+  {
+   "id": 73111,
+   "token": " fibonacci",
+   "bytes": [
+    32,
+    102,
+    105,
+    98,
+    111,
+    110,
+    97,
+    99,
+    99,
+    105
+   ],
+   "logprob": -0.08433066308498383,
+   "top_logprobs": [
+    {
+     "id": 73111,
+     "token": " fibonacci",
+     "bytes": [
+      32,
+      102,
+      105,
+      98,
+      111,
+      110,
+      97,
+      99,
+      99,
+      105
+     ],
+     "logprob": -0.08433066308498383
+    },
+    {
+     "id": 220,
+     "token": " ",
+     "bytes": [
+      32
+     ],
+     "logprob": -3.1607580184936523
+    },
+    {
+     "id": 318,
+     "token": " (",
+     "bytes": [
+      32,
+      40
+     ],
+     "logprob": -4.4682722091674805
+    },
+    {
+     "id": 2168,
+     "token": " None",
+     "bytes": [
+      32,
+      78,
+      111,
+      110,
+      101
+     ],
+     "logprob": -4.961607933044434
+    },
+    {
+     "id": 2542,
+     "token": " sum",
+     "bytes": [
+      32,
+      115,
+      117,
+      109
+     ],
+     "logprob": -5.475424766540527
+    }
+   ]
+  }
+ ]
+}

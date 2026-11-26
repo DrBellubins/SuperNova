@@ -1,0 +1,14 @@
+[package]
+name = "sn-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SuperNova command line: plan dump, reference forward, benchmarks"
+
+[[bin]]
+name = "sn"
+path = "src/main.rs"
+
+[dependencies]
+sn-core = { path = "../sn-core" }

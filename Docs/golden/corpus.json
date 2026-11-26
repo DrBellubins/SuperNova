@@ -1,0 +1,31 @@
+{
+  "note": "Phase 2 golden corpus. Fixed prompts, greedy, seed 0. Token ids are produced by the reference tokenizer (Tools/tokenize.sh -> llama-server /tokenize) and stored in tokens/*.ids; the GGUF BPE tokenizer itself is Phase 10 work. Keep this list frozen: every later phase is measured against it.",
+  "sampling": { "greedy": true, "temperature": 0, "seed": 0 },
+  "prompts": [
+    {
+      "id": "p1-capital",
+      "text": "The capital of France is",
+      "why": "short factual continuation; single-token answer, so top-1 agreement is meaningful"
+    },
+    {
+      "id": "p2-arithmetic",
+      "text": "1, 2, 3, 4, 5, 6, 7, 8, 9,",
+      "why": "deterministic continuation, stresses positional behaviour over a short span"
+    },
+    {
+      "id": "p3-code",
+      "text": "def fibonacci(n):\n    if n <= 1:\n        return n\n    return",
+      "why": "code continuation with indentation and a multi-token answer"
+    },
+    {
+      "id": "p4-definition",
+      "text": "The mitochondria is the",
+      "why": "high-confidence idiomatic continuation"
+    },
+    {
+      "id": "p5-loop-pressure",
+      "text": "Q: What is the boiling point of water in Celsius?\nA: 100\nQ: What is the boiling point of ethanol in Celsius?\nA:",
+      "why": "longer structured prompt: more tokens through the loop body and all 48 mHC executions"
+    }
+  ]
+}

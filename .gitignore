@@ -1,2 +1,20 @@
 .pi/
+.abl/
+.oracle/
 Tools/__pycache__
+target/
+Cargo.lock
+
+# A scratch golden dir at the repo root (not the frozen corpus under Docs/).
+# `golden/` used to match Docs/golden too, which silently kept the corpus out of git.
+/golden/
+
+# Phase 2 stage dumps are regenerable (`sn ref --dump`); keep them out of git.
+dumps/
+*.log
+
+# Tools that link against the local llama.cpp build - build them with the command in
+# Docs/numerics.md, do not commit the binaries.
+Tools/sn-oracle
+Tools/tok
+Tools/*.o

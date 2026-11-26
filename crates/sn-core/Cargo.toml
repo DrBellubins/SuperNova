@@ -1,0 +1,16 @@
+[package]
+name = "sn-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "SenseNova-Loop inference core: GGUF reader, execution plan, numerics reference. No dependencies."
+
+[lib]
+name = "sn_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Intentionally empty: the engine is dependency-free (docs/design-plan.md §6 "no dependency tree").
+# OS/kernel access goes through the hand-written `extern "C"` declarations in `sys`, and (later)
+# HIP access through the hand-written bindings in `sn-hip`. Adding a crate needs a design change.

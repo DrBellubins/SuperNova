@@ -5,7 +5,10 @@ Computes real per-tensor byte sizes from GGUF offsets, then multiplies by the
 number of times each block is *executed* per decode token, so we get the true
 bytes/token that any decoder must stream from VRAM.
 
-Usage: roofline.py <model.gguf> [--bw GBPS] [--n-exec]
+Usage: roofline.py <model.gguf> [--bw GBPS] [--json]
+
+--json emits the per-tensor accounting (name, stored bytes, executions per token) plus totals,
+which is what Tools/plan-check.py diffs against `sn dump --plan --json`.
 """
 import os
 import re
@@ -47,6 +50,13 @@ def load(path):
     return md, infos, size
 
 
+def dtn(dt):
+    # GGML element type ids (ggml.h): only what this checkpoint uses needs a name.
+    names = {0: "f32", 1: "f16", 8: "q8_0", 10: "q2_k", 11: "q3_k", 12: "q4_k",
+             13: "q5_k", 14: "q6_k", 30: "bf16"}
+    return names.get(dt, f"type#{dt}")
+
+
 def main():
     path = sys.argv[1]
     bw = 240.0
@@ -69,6 +79,7 @@ def main():
 
     # how many times is each *GGUF block index* executed per forward?
     nexec = {}
+    per_tensor = []
     for il in range(n_layer):
         ph = phys(il)
         # block index used in tensor names (see conversion: physical -> first_visit)
@@ -93,6 +104,22 @@ def main():
         by_class[(cls, e)][0] += n
         by_class[(cls, e)][1] += 1
         tot += n * e
+        per_tensor.append({"name": name, "class": cls, "type": dtn(dt), "bytes": n,
+                           "visits": e, "bytes_per_token": n * e})
+
+    if "--json" in sys.argv:
+        import json
+        print(json.dumps({
+            "model": md.get("general.name"), "arch": p,
+            "n_layer": n_layer, "n_physical": n_layer - extra,
+            "loop": [loop_s, loop_e, loop_c], "extra_visits": extra,
+            "mhc": [md.get(f"{p}.mhc.start"), md.get(f"{p}.mhc.end")],
+            "mhc_executions": sum(1 for il in range(n_layer)
+                                  if md.get(f"{p}.mhc.start", 0) <= phys(il) < md.get(f"{p}.mhc.end", 0)),
+            "stored_bytes": sum(size.values()), "bytes_per_token": tot,
+            "tensors": per_tensor,
+        }))
+        return
 
     print(f"model            : {md.get('general.name')}")
     print(f"n_layer (exec)   : {n_layer}   physical: {n_layer - extra}   loop: [{loop_s},{loop_e}) x{loop_c}   MTP: {n_nextn}")

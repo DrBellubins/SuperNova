@@ -1,6 +1,7 @@
 # SuperNova — SenseNova‑Loop‑9B inference engine: architecture findings & phased implementation plan
 
-Author: pi · Date: 2026‑11‑26 · Model: `SenseNova-Loop-9B-Q4_K_M.gguf` · Target: ROCm/HIP, gfx1103 (RX 7700S, 8 GB)
+Author: pi · Date: 2026‑11‑26 · Model: `SenseNova-Loop-9B-Q4_K_M.gguf` · Target: ROCm/HIP, **gfx1102** (RX 7700S, 8 GB)
+· **Phase 0 measured: `Docs/baseline.md`** · Phase 1 gates: `cargo test` + `Tools/plan-check.py`
 
 Reference implementations consulted (read‑only, **not copied**):
 `llama.cpp-opensensenova` @ `24ea7bb78` — commits `40de7782e` ("llama : add SenseNova Loop support"),
@@ -46,7 +47,7 @@ nextn_predict_layers 1
 ssm.conv_kernel 4  ssm.group_count 16  ssm.inner_size 4096  ssm.state_size 128  ssm.time_step_rank 32
 rope.dimension_count 64 (partial: 64 of 256)  rope.dimension_sections [11,11,10,0]
 rope.freq_base 1e7  rope.scaling.type yarn  rope.scaling.factor 2.0  rope.scaling.original_context_length 262144
-vocab 248320 (token_embd Q2_K, output Q4_K — two separate tensors, not tied)
+vocab 248320 (token_embd Q4_K, output Q6_K — two separate tensors, not tied)
 ```
 
 ### 1.1 The execution plan (the loop, made concrete)
@@ -80,9 +81,26 @@ do not exist. Any loader must build this map itself; hardcoding `blk.N == block 
 | + mHC routers | 4..27 | 24 | the above **plus** `hc_attn_fn.weight[8192,8]`+`.bias[8]`, `hc_ffn_fn.weight[8192,8]`+`.bias[8]` — **f32 only** (quantizer refuses to touch `hc_*`) |
 | MTP | 56 | 1 | full‑attn block + `nextn.eh_proj[8192,4096]`, `nextn.enorm`, `nextn.hnorm`, `nextn.shared_head_norm` |
 
-Quant mix (exact, from offsets): FFN is mostly **Q2_K**, `attn_qkv_gate` is **Q4_K** for blocks 0‑2/28‑31 and
-**Q2_K** for most looped blocks, `attn_q/k` Q2_K, `attn_v`/`ffn_down` (some) Q4_K, `output` Q4_K, `token_embd` Q2_K.
-Routers, `ssm_conv1d`, all norms, `ssm_a`, `ssm_dt` are **f32**.
+Quant mix — **corrected 2026‑11‑26 by `Tools/tensor_census.py`** (exact per‑tensor bytes, cross‑checked against
+offset gaps; `Tools/gguf_dump.py --tensors` had a stale type table and a wrong size formula, which is where the
+previous paragraph's "Q2_K" came from — there is **no Q2_K in this file**). Types present: **Q4_K ×177**
+(3,824,418,816 B), **Q6_K ×33** (1,966,325,760 B), **f32 ×280** (16,913,920 B) = 5,807,658,496 B, 0 gaps
+anomalies. Per role (block indices are GGUF names):
+
+| tensor | Q4_K | Q6_K |
+|---|---|---|
+| `ffn_gate`, `ffn_up` | all 33 blocks | — |
+| `ffn_down` | 7‑8,10‑11,13‑14,16‑17,19‑20,22‑23,25‑26,52‑53,55‑56 (18) | 0‑6,9,12,15,18,21,24,27,54 (15) |
+| `attn_qkv_gate` | 4‑5,8,10,13‑14,16‑17,20,22,25‑26 (12) | 0‑2,6,9,12,18,21,24,52‑54 (12) |
+| `attn_q`, `attn_k`, `attn_output` | all 9 attn blocks | — |
+| `attn_v` | 7,11,19,23 (4) | 3,15,27,55‑56 (5) |
+| `ssm_out`, `ssm_beta_alpha` | all 24 GDN blocks | — |
+| `token_embd` | ✓ | — |
+| `output` | — | ✓ |
+
+So the FFN — 4.85 GB of the 8.81 GB streamed per decoded token — is **Q4_K throughout**, and `attn_q/k` are Q4_K too.
+Routers, `ssm_conv1d`, all norms, `ssm_a`, `ssm_dt` are **f32**. Phase 5 therefore needs **Q4_K + Q6_K + f32**
+dequant/GEMM paths (no Q2_K, no Q5_K/Q8_0 in the checkpoint).
 
 Derived GDN dimensions (note the head asymmetry — a frequent source of wrong implementations):
 
@@ -133,8 +151,8 @@ out = wo @ ( sigmoid(g) ⊙ o )       # gate applied AFTER attention, BEFORE wo
 ```
 qkvz = wqkv_z @ x                                  # [12288, T]
 qkv  = qkvz[0:8192];  z = qkvz[8192:12288]
-beta_raw  = w_beta_alpha[0:64]     @ x             # [32, T]
-alpha_raw = w_beta_alpha[64:128]   @ x             # [32, T]     (one fused [4096,64] tensor)
+beta_raw  = w_beta_alpha[:, 0:32]  @ x             # [32, T]   (32 = n_v_heads = d_inner/d_state)
+alpha_raw = w_beta_alpha[:, 32:64] @ x             # [32, T]   one fused [4096,64] tensor, rows split in half
 beta  = sigmoid(beta_raw)                                   # per v-head
 gate  = ssm_a[h] * softplus(alpha_raw[h] + ssm_dt[h])       # ssm_a is STORED AS -exp(A_log): all values < 0
 conv  = causal_depthwise_conv(conv_states ++ qkvᵀ, ssm_conv1d[4, 8192])   # left pad 3 from cache
@@ -169,9 +187,15 @@ freq_scale = 1 / 2.0 = 0.5      ext_factor = 1.0 (because scaling.type == yarn)
 attn_factor = 1.0               beta_fast = 32   beta_slow = 1     n_ctx_orig = 262144
 corr[0] = 64·ln(262144/(32·2π)) / (2·ln(1e7)) = 14.241    corr[1] = 64·ln(262144/(1·2π)) / (2·ln(1e7)) = 21.122
            # rope_yarn_corr_dims(n_rot=64, n_ctx_orig=262144, beta_fast=32, beta_slow=1, base=1e7)
-ramp(p)   = clamp((p − corr[0]) / (corr[1] − corr[0]), 0, 1)
+           # **then truncated**: `ggml_rope_yarn_corr_dims` (ggml.c:4377) floors corr[0] and ceils corr[1]
+           # before clamping to [0, n_rot-1], and the rope node keeps truncate on by default
+           # (`ggml_rope_get_truncate` == `op_params[3] == 0`, nothing calls set_truncate(false)).
+           # The values actually used are **[14, 22]** — pinned by num::tests::rope_parameters_*.
+ramp(p)   = 1 − clamp((p − corr[0]) / (corr[1] − corr[0]), 0, 1)   # 1 below corr[0], 0 above corr[1]
 θ_p       = θ_interp·(1 − ramp) + θ_extrap·ramp,  θ_interp = 0.5·θ_extrap
+           # low pair indices keep the *unscaled* θ_extrap (ramp 1); `ramp = clamp(...)` inverts this
 mscale    = 1 + 0.1·ln(1/0.5) = 1.06931   ->  cos/sin both × mscale   (net ×1.143 on logits: keep it)
+           # θ accumulates as pos · base^(-2p/n_rot) in f32, one multiply per pair (ggml_rope_cache_init)
 ```
 Because 4 positions are expected per token by the reference, a text‑only driver must still feed `pos` (×1) and may
 skip the 3 unused copies. Do **not** silently switch to `norm` RoPE: with sections present the reference path differs.
@@ -213,6 +237,59 @@ MTP (Phase 9): `h = eh_proj([enorm(tok_embd) ; hnorm(h_hidden)])` then a full‑
 (identical to §2.3/§2.5) then `shared_head_norm` → `output` head. MTP consumes the trunk's pre‑head hidden state
 (`h_nextn`) and re‑uses the LM head. Draft requires **state rollback** of the GDN caches (the reference
 `n_rs_seq` snapshot machinery), which is why MTP lands late in the plan.
+
+### 2.9 Weight reading verified against a second implementation (2026‑11‑26)
+
+`Tools/dequant_ref.py` dequantises rows straight out of the GGUF, transliterated from GGML's C
+(`dequantize_row_q4_K`, `get_scale_min_k4`, `dequantize_row_q6_K`, field layouts from
+`ggml-common.h`), and diffs them against `sn deq`. Everything agrees to printing precision, so the
+way §2 reads weights is correct as written:
+
+| type | rows checked | worst difference |
+|---|---|---|
+| `f32` (routers, conv taps) | `blk.4.hc_attn_fn.weight` 0/7, `blk.4.ssm_conv1d.weight` 0/3 | 4.9e‑11 |
+| `q4_k` | `attn_q` 0/4095, `attn_qkv_gate` 0/1, `ffn_gate` 0/3, `ssm_out` 2, `ssm_beta_alpha` 5, `nextn.eh_proj` 0, `token_embd` 0/4095 | 6.9e‑11 |
+| `q6_k` | `output.weight` 0/7, `ffn_down` 0/12287 | 4.3e‑11 |
+
+The 1e‑11 residual is `d * sc * q` computed in f32 by both engines and in double by the comparer —
+not a format difference. Layouts for the record: `block_q4_K = { d @0, dmin @2, scales[12] @4,
+qs[128] @16 }`; sub‑block `2p` = low nibbles of `qs[32p..32p+32]`, `2p+1` = high nibbles of the
+*same* 32 bytes; scale/min nibbles exactly as `get_scale_min_k4`. `block_q6_K = { ql[128] @0,
+qh[64] @128, int8 scales[16] @192, d @208 }`, two 128‑value half‑blocks advancing `ql += 64`,
+`qh += 32`, `sc += 8`, values scattered to `l, l+32, l+64, l+96` with scale indices
+`is, is+2, is+4, is+6` (`is = l/16`).
+
+Two §2 wording fixes this settled (applied): the GDN L2 norm is `x / sqrt(Σx² + eps)` with
+`eps = 1e‑6` — `build_gdn_l2_norm` (`src/models/models.h:14`) is `rms_norm(x, eps/n) *
+(1/sqrt(n))`, which collapses to that — not "`eps/128`"; and the mHC merge consumes `exp(mix)`
+**after** the 20 Sinkhorn sweeps, because the sweeps run in log space. Omitting the exponent makes
+the merge multiply the streams by negative log‑mix values and the hidden state reaches `inf` around
+layer 46.
+
+**Working note — where the forward stands (updated 2026‑11‑26, supersedes the earlier "direction is
+wrong at position 0" note, which is no longer true).** The differential oracle for this is
+`Tools/{truncate.py,prefix-check.py,def32.py,sn-oracle.c,ablate.py}`: `truncate.py` writes a model
+whose trunk *is* the first K executions (§1.1 makes that exact), `def32.py` rewrites block weights as
+f32 so quantisation stops being a variable, and `sn-oracle.c` reads per-layer hidden states out of
+libllama (`llama_set_embeddings_layer_inp`; force the CPU backend — with the ROCm split graph,
+`extract_layer_inputs` aborts on `backend != nullptr`, `llama-context.cpp:2807`).
+
+* Position 0, full model: `h_final` cos **0.99995** vs the reference; every prefix K ∈ {5…28, 52}
+  agrees at cos ≥ 0.9996, and with f32 block weights **cos = 1.00000000**. Embedding, dequant, the
+  block-index remap, the norms, the mHC route/Sinkhorn/merge and the FFN are exact.
+* Multi token: agreement decays with position, and with f32 weights the decay starts **inside the
+  full-attention block once its cache has more than one token** — the layer inputs into blocks 1, 2,
+  3 stay at 1.00000000 for positions 0‑2 while the input into block 4 drops to 0.99999 at position 1.
+  So the GDN state, decay and conv window are exact across positions. Ruled out by measurement:
+  weight quantisation, KV storage type (`--kv-f16`: 1e‑6), the conv window (`--onehot
+  ssm_conv1d.weight:3`), and float rounding (position 0 is bit-exact). Open: the multi-token score
+  path — candidates are the four IMROPE position sections for text (`ggml_mrope_cache_init`) and the
+  GQA head→KV pairing. `rope.dimension_count = 0` is not usable as a probe (the reference aborts
+  "tensor buffer not set").
+* One real defect found and fixed while doing this: the YaRN **correlation dims are truncated**
+  (`[14, 22]`, not the raw `[14.241, 21.122]` §2.6 used to quote). Its effect is only ~1e‑6, but the
+  unit test had pinned the wrong values, which is exactly how such a bug survives — see §2.6.
+
 
 ---
 
@@ -275,19 +352,18 @@ each node amortises over `T` tokens; the launch count per *chunk* is unchanged.
   the 20‑sweep non‑convergent balancing (§2.7), the two `1/sqrt(128)` factors (§2.4), `sigmoid(g)` after attention
   (§2.3), and prefix caching being legal only for **KV + GDN state snapshots taken together**.
 
-### 4.4 Phase 0 verification recipe (5 min, on the user's GPU — do this before writing kernels)
+### 4.4 Phase 0 verification recipe — **DONE 2026‑11‑26, results in `Docs/baseline.md`**
+The recipe ran end to end on this box (GPU present, `/dev/kfd` available). `rocprofv2`/`rocprofv3` are **not
+installed** here, so step 3 uses an `LD_PRELOAD` shim instead (`Tools/hip_count.c`, driven by `Tools/phase0.sh`,
+which also captures `sched_reserve`, offload counts, graph counters, `rocm-smi` VRAM and the server's CPU time):
 ```bash
-# 1) how many nodes does one decode token really cost?
-llama-server -m .../SenseNova-Loop-9B-Q4_K_M.gguf -ngl 99 -c 4096 -v 2>&1 | grep sched_reserve
-# 2) is HIP graph capture actually engaged?
-GGML_CUDA_GRAPH_DEBUG=1 llama-server ... 2>&1 | grep -iE "cuda graph|warmup"
-# 3) count real kernel launches for 32 decode tokens (expect ~1.5–2.7 million if the flaw is live)
-rocprofv2 --hip-api -o /tmp/prof -- llama-cli -m ... -n 32 -p "hi" -ngl 99 -c 4096
-grep -c "hipLaunchKernel" /tmp/prof/*.csv
+./Tools/phase0.sh all                       # launch + cold + fill passes, artifacts in /tmp/phase0/
 ```
-If (3) shows ≳ 10⁵ launches/token, the diagnosis is confirmed and SuperNova's core design (below) is justified.
-If (2) shows graphs *are* engaged and decode is still 5 t/s, the flaw is graph instantiate/update cost instead —
-same conclusion, still requires a static small op list.
+Confirmed: `sched_reserve: max_nodes = 83648` at every `n_ctx`; **4,700 `hipLaunchKernel` + 181 `hipGraphLaunch`
++ 253 `hipMemcpyAsync` per decoded token** (291 graph plans captured, 126 graph updates failed); decode flat at
+**4.39–4.48 t/s** from 1 k to 32 k context while prefill reaches 218 t/s (379 t/s on a 7.7 k prompt); GPU busy
+43–47 % with the server process at ~8 cores. Graphs *are* engaged, so the cost is the per-node host work, exactly
+the §4 diagnosis: the fix is a small static op list replayed as one graph, not graph tuning.
 
 ---
 
@@ -305,7 +381,7 @@ weight bytes streamed per decoded token   8.814 GB   (x1.52: blocks 4..27 read t
    - token_embd                  0.00 GB (1 row)
    - attn q/k/v/o                0.46 GB
    - mHC routers (f32)           0.05 GB
-RX 7700S (gfx1103, 128-bit GDDR6): 256 GB/s spec, ~215 GB/s achievable
+RX 7700S (gfx1102 per rocminfo, 128-bit GDDR6): 256 GB/s spec, ~215 GB/s achievable
    -> 8.72 GB / 215 GB/s = 40.6 ms/token  ->  24.6 t/s decode ceiling
 prefill (weights read once per chunk, compute bound): ~370 t/s at 25 % of FP16 WMMA peak
 ```
@@ -353,7 +429,8 @@ Tools/          # gguf_dump.py, roofline.py (+ future: dump-diff.py, golden-chec
 Docs/
 ```
 `cargo` only, no `cc`/`bindgen` for HIP (raw `hipcc`/`hip::device` via `build.rs` invoking `/opt/rocm/bin/hipcc`,
-link `libhipblas` only if we ever need it — plan is to not need it). `gfx1103` arch flag. Target a static lib + CLI;
+link `libhipblas` only if we ever need it — plan is to not need it). `gfx1102` arch flag (`--offload-arch=gfx1102`;
+`gfx1103` is the same ISA family and works as a fallback, but build for what `rocminfo` reports). Target a static lib + CLI;
 no `main` in kernels. `unsafe` confined to `sn-hip`.
 
 ---
@@ -363,13 +440,15 @@ no `main` in kernels. `unsafe` confined to `sn-hip`.
 Each phase ends green: `cargo test` + a named acceptance gate. Phases 1‑6 build the *correct* engine;
 7‑9 make it *fast*; 10 makes it usable. Do not skip the gates — the later phases diff against earlier dumps.
 
-### Phase 0 · Instrument the fork, freeze the targets (0.5 day)
+### Phase 0 · Instrument the fork, freeze the targets (0.5 day) — **DONE 2026‑11‑26**
 *Run §4.4 on the GPU. Record node count, launches/token, graph status, t/s at `n_ctx ∈ {1k, 8k, 32k}`.*
 **Feeds:** §5 becomes measured, not estimated; if the launch hypothesis is wrong we learn it for 30 minutes
 instead of 3 weeks.
-**Gate:** `Docs/baseline.md` with the numbers + the exact command lines.
+**Gate:** `Docs/baseline.md` with the numbers + the exact command lines. → **delivered**; the tooling is
+`Tools/phase0.sh` (+ `Tools/hip_count.c`, `Tools/rocprof_check.sh` / `Tools/rocprof_parse.py` once
+`rocprofv2` was installed), artifacts in `/tmp/phase0` and `/tmp/rp2`.
 
-### Phase 1 · GGUF reader, hyperparameters, execution plan (1–2 days)
+### Phase 1 · GGUF reader, hyperparameters, execution plan (1–2 days) — **DONE 2026‑11‑26**
 `sn-core::gguf`: v2/v3 header, KV typed values, tensor info + exact byte sizes from offsets (handle `alignment`),
 mmap + `madvise`. `sn-core::plan`: reproduce §1.1 — `physical(il)`, `is_recr(il)`, block‑index remap, mHC range
 validity, the fork's validation rules (loop fits, mHC must not straddle a loop boundary, streams == 2,
@@ -379,6 +458,15 @@ validity, the fork's validation rules (loop fits, mHC must not straddle a loop b
 `physical(0)=0, physical(4)=4, physical(27)=27, physical(28)=4, physical(51)=27, physical(52)=28, physical(55)=31`;
 test that `blk.52..55` resolve to physical 28..31; test rejection of an mHC range that straddles the loop.
 
+*Status:* `crates/sn-core/src/{gguf,plan,budget,qtypes,sys,error}.rs` + `crates/sn-cli` (`sn dump --plan
+[--json]`, `sn dump --tensors`, `sn dump --meta`, `sn info`). Gate evidence: `cargo test` (5 lib + 7
+`tests/plan_gates.rs` + 1 `tests/real_model.rs`) green, and `python3 Tools/plan-check.py <model>` reports
+`OK: sn and roofline.py agree byte-for-byte on every tensor` (490 tensors, stored 5,807,658,496 B,
+8,813,935,104 B/token, 48 mHC executions). Two facts the plan had wrong, now pinned by tests: the checkpoint
+holds **no Q2_K** (§1.2 table), and of the 14 full-attention KV buffers only 8 distinct blocks back them —
+`kv_bytes_per_token` counts the 14 (a looped block's K/V cannot be shared), `kv_bytes_per_token_unique` is a
+diagnostic that the Phase 0 VRAM slope rules out.
+
 ### Phase 2 · Scalar CPU reference + golden corpus (3–5 days) — *the spec*
 Full f32 forward of §2 in plain Rust (weights dequantised on the fly), driven by token ids. Stage‑level
 `cb()`‑style dumps: `embd`, per‑execution `l_out`, `a`,`b` streams at mHC boundaries, `mhc_logits[8]`,
@@ -386,12 +474,44 @@ Full f32 forward of §2 in plain Rust (weights dequantised on the fly), driven b
 **Deliverables:** `sn ref --prompt-file p.txt --dump golden/`, `Tools/golden-check.py` (NMSE + max‑abs per stage),
 and — this is what makes every later phase cheap — a **fork cross‑check**: the same prompt fed to
 `llama-server`'s `/tokenize` + `/completion` with `--log-verbose` logits dump, compared to `sn ref` logits.
-**Gate:** `sn ref` top‑1 token matches the fork for 5 fixed prompts at greedy decoding, and `logit NMSE ≤ 1e‑4`
-after the full prompt; `sn ref --iters 6` is *visibly different* (proving the 20‑sweep sensitivity is exercised).
+**Gate:** `sn ref` top‑1 token matches the fork for 5 fixed prompts at greedy decoding, and `logit
+NMSE` is within `3 ×` the **measured** reference-vs-reference floor (`--floor-dir Docs/golden/ref-cpu/ref`;
+the original `≤ 1e‑4` is unreachable against a q8_0-operand oracle — see `Docs/numerics.md` §2);
+`sn ref --iters 6` is *visibly different* (proving the 20‑sweep sensitivity is exercised).
 Also emits `Docs/numerics.md` = §2 as tested code. **This phase is the one that de‑risks the whole project.**
 
+**Status (2026‑11‑26): code complete, one open numerics item, gate re‑specified against a measured
+floor.** Built: `crates/sn-core/src/{dq,num,forward}.rs`, `sn ref` (with `--dump`, `--dump-only`,
+`--limit-exec`, `--iters`, `--logits-out`, `--kv-f16`, `--f16-weights/--f16-acts`), `sn deq`,
+`Docs/golden/{corpus.json,tokens,ref,ref-cpu,embd,embd-cpu}` and
+`Tools/{golden-ref.py, golden-check.py, golden-embd.py, dequant_ref.py, stage-check.py, tok.c,
+ablate.py, truncate.py, prefix-check.py, def32.py, sn-oracle.c}` — `tok.c` drives the reference
+tokenizer through `libllama` because the GGUF BPE tokenizer is Phase 10 and this fork's `/tokenize`
+answers 501. `Docs/numerics.md` is §2 as tested code: every rule with the test / measurement that
+pins it, plus the measured agreement.
+
+Gate results as run (`Tools/golden-check.py --floor-dir Docs/golden/ref-cpu/ref`, 2026‑11‑26):
+
+* **top‑1 matches the reference for 5/5 corpus prompts** (rank of our top‑1 inside the reference's
+  ordering: 0 everywhere).
+* centred logit NMSE vs the reference: 1.8e‑3 / 9.6e‑3 / 8.9e‑3 / 2.4e‑3 / 4.8e‑2 for the five
+  prompts, against a **measured floor of 3.6e‑3 / 1.8e‑3 / 1.1e‑2 / 6.7e‑3 / 8.2e‑3** — the spread
+  between two captures of the *same* checkpoint through two of the fork's own backends (ROCm-host vs
+  CPU). The plan's original "≤ 1e‑4" is unreachable against a q8_0-operand oracle, so the gate is
+  `max(1e‑4, 3 × that floor)`; it currently fails on the two longest prompts (2.4× and 5.9× their
+  floor), which is §2.9's open attention item, not a weights/caches/plan problem.
+* 20 vs 6 sweeps (`--iters 6 --compare-iters 20`): mean |Δlogit| 0.37‑0.81, max 6.41 — the
+  20‑sweep contract is exercised, not assumed. (Top‑1 survives; the distribution moves by logits.)
+* Prefix localization (`Tools/prefix-check.py`, `Tools/def32.py`): every truncated model that is a
+  prefix of the trunk agrees with the reference at cos ≥ 0.9996 with quantised weights and to
+  1.00000000 with f32 weights at position 0; the first multi-token disagreement is inside the
+  full-attention block. Details and the ruled-out causes: §2.9.
+
+Phase 2 is therefore the spec it was meant to be: the single-token forward is exact, the corpus and
+the tooling are frozen, and the one remaining gap has a name and a location.
+
 ### Phase 3 · HIP substrate + static decode program (4–6 days)
-Device/context/queue on `gfx1103`; a single big allocation (one `hipMalloc` for weights, one for the arena, one for
+Device/context/queue on `gfx1102`; a single big allocation (one `hipMalloc` for weights, one for the arena, one for
 caches); `Arenas` handing out compile‑time offsets; `Op` enum + `Program` builder + `hipGraph` capture/replay with
 pinned‑host token/pos inputs; `sn-hip::launch!` macro and a `KernelRegistry` keyed by `(name, shape, dtype)`;
 a `--no-graph` path for debugging and a `SN_TRACE=ops` mode printing per‑launch timings.
@@ -412,8 +532,10 @@ decode step ≤ **300**.
 
 ### Phase 5 · Quantised GEMM for Q2_K / Q4_K / f32 (5–8 days) — the bandwidth half
 Decode (T=1) path first: memory‑bound `gemv`, warp‑per‑superblock, `__builtin_amdgcn_` 16‑bit packed ops for the
-4/2‑bit unpack, 128‑byte loads, one pass, f32 accumulate, no smem staging; block sizes tuned on gfx1103's 32 CUs.
-Prefill path: tiled GEMM with `mma.f32.f16` (RDNA3 WMMA; **no MFMA on gfx1103** — keep the CDNA `mfma` path behind a
+4/6‑bit unpack (`Q4_K` + `Q6_K` are the only quantised types in the checkpoint), 128‑byte loads, one pass, f32
+accumulate, no smem staging; block sizes tuned on gfx1102's **32 CUs** (KFD `simd_count 64 / simd_per_cu 2`,
+max clock 2208 MHz — see `Docs/baseline.md` §1) and wavefront 32.
+Prefill path: tiled GEMM with `mma.f32.f16` (RDNA3 WMMA; **no MFMA on gfx1102** — keep the CDNA `mfma` path behind a
 `cfg`/runtime arch check, don't build a kernel that can't launch here), weight tiles streamed once, dequant to f16 in smem.
 **Deliverables:** `gemv_q4k/q2k/f32`, `gemm_q4k/q2k/f32` (T up to 2048), an auto‑pick by `(T, n, k)`, a
 `sn bench gemm` sweep. **Feeds:** real forward passes.
@@ -437,7 +559,7 @@ capture one `hipGraph`; move token/pos to pinned memory; drop the per‑layer `l
 fold RoPE into the Q/K producer and the attention gate into `wo`'s epilogue; verify no host allocation and no
 `hipMemcpy`/`hipMemcpy*Async` (other than the pinned writes) inside the decode loop; `SN_TRACE` shows op count ≤ 300.
 **Gate:** ≥ **20 t/s** decode at `n_ctx=8196`, ≤ **7.0 GB** VRAM at `n_ctx=32768` with q8_0 KV, CPU < 5 %,
-and `rocprofv2 --hip-api` shows ≤ **2 hipLaunchKernel + 1 hipGraphLaunch per token** (the Phase 0 counter must
+and the Phase 0 launcher (`Tools/hip_count.c`) shows ≤ **2 hipLaunchKernel + 1 hipGraphLaunch per token** (the Phase 0 counter measured
 drop from ~10⁵ to ~1). **This phase is the thesis of the project; if the gate fails, stop and profile.**
 
 ### Phase 8 · Prefill fast path (4–6 days)
@@ -461,7 +583,7 @@ GGUF BPE tokenizer + chat template (the GGUF ships a jinja template with vision 
 `<|image_pad|>` rejected cleanly), sampler set (temp/top‑k/top‑p/min‑p, repetition), OpenAI‑ish HTTP endpoint,
 state save/load (`/state` for GDN + KV so 32 k prompts reload without re‑prefill), graceful VRAM failure from the
 Phase 1 budget check, docs: `Docs/architecture.md` (self‑contained, from §1‑§3), `Docs/why-its-fast.md` (from §4‑§6),
-CI on `gfx1103` running the golden corpus + `sn bench` regression thresholds.
+CI on `gfx1102` running the golden corpus + `sn bench` regression thresholds.
 **Gate:** cold start → first token < 60 s; 32 k prompt reload from state < 5 s; every acceptance number from
 Phases 7‑9 reproduced in CI.
 
@@ -475,7 +597,8 @@ Phases 7‑9 reproduced in CI.
   resolved descriptors.
 * **No CPU work in the decode loop.** Enforce mechanically: a debug assertion that the decode path performs no
   allocation, no `hipMemcpy`, no `hipMemcpy*Async` (other than the pinned writes) and no more than 3 HIP calls.
-* **gfx1103 is the primary target, CDNA (`gfx942`) is a `cfg` variant.** Do not let an MFMA path become the only
+* **gfx1102 is the primary target (`rocminfo` on this box; `lspci` reports the same card as device `0x7480`),
+  CDNA (`gfx942`) is a `cfg` variant.** Do not let an MFMA path become the only
   correct code path — it will be untestable here.
 * Keep `Docs/gemini-arch.md` for what it is (an overview); §1‑§3 supersede it.
 

@@ -1,0 +1,184 @@
+{
+ "index": 0,
+ "content": " powerhouse",
+ "tokens": [],
+ "id_slot": 3,
+ "stop": true,
+ "model": "/home/justin/Documents/AI/Models/SenseLoop/SenseNova-Loop-9B-Q4_K_M.gguf",
+ "tokens_predicted": 1,
+ "tokens_evaluated": 5,
+ "generation_settings": {
+  "seed": 0,
+  "temperature": 0.0,
+  "dynatemp_range": 0.0,
+  "dynatemp_exponent": 1.0,
+  "top_k": 40,
+  "top_p": 0.949999988079071,
+  "min_p": 0.05000000074505806,
+  "top_n_sigma": -1.0,
+  "xtc_probability": 0.0,
+  "xtc_threshold": 0.10000000149011612,
+  "typical_p": 1.0,
+  "repeat_last_n": 64,
+  "repeat_penalty": 1.0,
+  "presence_penalty": 0.0,
+  "frequency_penalty": 0.0,
+  "dry_multiplier": 0.0,
+  "dry_base": 1.75,
+  "dry_allowed_length": 2,
+  "dry_penalty_last_n": 64,
+  "dry_sequence_breakers": [
+   "\n",
+   ":",
+   "\"",
+   "*"
+  ],
+  "mirostat": 0,
+  "mirostat_tau": 5.0,
+  "mirostat_eta": 0.10000000149011612,
+  "adaptive_target": -1.0,
+  "adaptive_decay": 0.8999999761581421,
+  "stop": [],
+  "max_tokens": 1,
+  "n_predict": 1,
+  "n_keep": 0,
+  "n_discard": 0,
+  "ignore_eos": false,
+  "stream": false,
+  "logit_bias": [],
+  "n_probs": 5,
+  "min_keep": 0,
+  "grammar": "",
+  "grammar_lazy": false,
+  "grammar_triggers": [],
+  "preserved_tokens": [],
+  "chat_format": "Content-only",
+  "reasoning_format": "deepseek",
+  "reasoning_in_content": false,
+  "generation_prompt": "",
+  "samplers": [
+   "penalties",
+   "dry",
+   "top_n_sigma",
+   "top_k",
+   "typ_p",
+   "top_p",
+   "min_p",
+   "xtc",
+   "temperature"
+  ],
+  "speculative.types": "none",
+  "timings_per_token": false,
+  "post_sampling_probs": false,
+  "backend_sampling": false,
+  "lora": []
+ },
+ "prompt": "The mitochondria is the",
+ "has_new_line": false,
+ "truncated": false,
+ "stop_type": "limit",
+ "stopping_word": "",
+ "tokens_cached": 5,
+ "timings": {
+  "cache_n": 0,
+  "prompt_n": 5,
+  "prompt_ms": 1409.506,
+  "prompt_per_token_ms": 281.9012,
+  "prompt_per_second": 3.5473421184443343,
+  "predicted_n": 1,
+  "predicted_ms": 0.001,
+  "predicted_per_token_ms": 0.0,
+  "predicted_per_second": 0.0
+ },
+ "completion_probabilities": [
+  {
+   "id": 71594,
+   "token": " powerhouse",
+   "bytes": [
+    32,
+    112,
+    111,
+    119,
+    101,
+    114,
+    104,
+    111,
+    117,
+    115,
+    101
+   ],
+   "logprob": -0.06449935585260391,
+   "top_logprobs": [
+    {
+     "id": 71594,
+     "token": " powerhouse",
+     "bytes": [
+      32,
+      112,
+      111,
+      119,
+      101,
+      114,
+      104,
+      111,
+      117,
+      115,
+      101
+     ],
+     "logprob": -0.06449935585260391
+    },
+    {
+     "id": 2660,
+     "token": " site",
+     "bytes": [
+      32,
+      115,
+      105,
+      116,
+      101
+     ],
+     "logprob": -3.3337044715881348
+    },
+    {
+     "id": 2279,
+     "token": " power",
+     "bytes": [
+      32,
+      112,
+      111,
+      119,
+      101,
+      114
+     ],
+     "logprob": -4.72439432144165
+    },
+    {
+     "id": 4649,
+     "token": " energy",
+     "bytes": [
+      32,
+      101,
+      110,
+      101,
+      114,
+      103,
+      121
+     ],
+     "logprob": -5.968466281890869
+    },
+    {
+     "id": 2691,
+     "token": " cell",
+     "bytes": [
+      32,
+      99,
+      101,
+      108,
+      108
+     ],
+     "logprob": -6.062282085418701
+    }
+   ]
+  }
+ ]
+}

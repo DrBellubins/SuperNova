@@ -1,0 +1,10 @@
+[package]
+name = "sn-hip"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Hand-written ROCm/HIP bindings + graph capture for SuperNova (Phase 3+)"
+
+[dependencies]
+sn-core = { path = "../sn-core" }

@@ -1,0 +1,472 @@
+--- Passage 1 ---
+The history of stored-program computers begins with machines whose programs were the wiring.
+The ENIAC of 1945 was reprogrammed by moving cables and setting switches, and a single
+change of problem could take a team of operators several days. The idea that a program could
+be written in the same memory as the data it transforms — the stored-program concept, drafted
+in the First Draft of a Report on the EDVAC by John von Neumann and colleagues in 1945 —
+removed that constraint, and with it removed the distinction between a machine that computes
+trajectories and a machine that sorts names. Everything after that is engineering in the shadow
+of that one idea.
+
+Two engineering problems have shadowed every generation of hardware since. The first is that
+arithmetic got cheap faster than movement got cheap. A modern GPU can perform a trillion
+floating-point operations per second while a single stream of memory reads stalls for hundreds
+of cycles; a decoder that walks a long list of small operations, issuing each one separately,
+will spend most of its clock waiting for the host to tell it what to do next. The second is
+that the programs we most want to run are recurrent. A language model that re-reads its own
+weights several times per token, or that keeps a persistent state across tokens, multiplies the
+movement problem rather than the arithmetic problem, and it does so in exactly the place where
+a generic runtime, which counts nodes and rebuilds plans, is least willing to help.
+
+This document measures both problems in a concrete system: an inference engine for a
+looped-transformer language model with a hybrid attention stack, running on a laptop-class
+RDNA3 GPU with eight gigabytes of memory. The model executes thirty-two physical blocks fifty-six
+times per token, keeps gated-deltanet recurrent state for forty-two of those executions, and
+balances two residual streams with a routing matrix that is deliberately not solved to
+convergence. The reference implementation builds a graph of eighty-four thousand nodes for a
+single decoded token, and it runs at five tokens per second on hardware whose memory bandwidth
+would support twenty-five.
+
+The measurements that follow ask three questions. How many nodes does the engine really reserve
+per token? How many device launches does it really issue? And how much of the machine is idle
+while the host is busy? If the answer to the third question is "most of it", the correct fix is
+not a cleverer kernel, a smaller quantisation, or a faster allocator. The correct fix is to stop
+compiling the program per token, and to compile it once, at load time, with every pointer already
+known. That is the thesis of the project this document introduces.
+
+A note on method. Every number in this document is produced by a command line that is printed
+next to it, and every command line is checked into the repository alongside the number. Where a
+measurement cannot be reproduced on the machine that reads this document, the reason is stated.
+Where a number is an estimate rather than a measurement, it is labelled as an estimate. Adjectives
+are not results: "faster" is not a status, and neither is "optimised". A result is a pair of
+numbers, before and after, with the same input, the same seed, and the same hardware.
+
+--- Passage 2 ---
+The history of stored-program computers begins with machines whose programs were the wiring.
+The ENIAC of 1945 was reprogrammed by moving cables and setting switches, and a single
+change of problem could take a team of operators several days. The idea that a program could
+be written in the same memory as the data it transforms — the stored-program concept, drafted
+in the First Draft of a Report on the EDVAC by John von Neumann and colleagues in 1945 —
+removed that constraint, and with it removed the distinction between a machine that computes
+trajectories and a machine that sorts names. Everything after that is engineering in the shadow
+of that one idea.
+
+Two engineering problems have shadowed every generation of hardware since. The first is that
+arithmetic got cheap faster than movement got cheap. A modern GPU can perform a trillion
+floating-point operations per second while a single stream of memory reads stalls for hundreds
+of cycles; a decoder that walks a long list of small operations, issuing each one separately,
+will spend most of its clock waiting for the host to tell it what to do next. The second is
+that the programs we most want to run are recurrent. A language model that re-reads its own
+weights several times per token, or that keeps a persistent state across tokens, multiplies the
+movement problem rather than the arithmetic problem, and it does so in exactly the place where
+a generic runtime, which counts nodes and rebuilds plans, is least willing to help.
+
+This document measures both problems in a concrete system: an inference engine for a
+looped-transformer language model with a hybrid attention stack, running on a laptop-class
+RDNA3 GPU with eight gigabytes of memory. The model executes thirty-two physical blocks fifty-six
+times per token, keeps gated-deltanet recurrent state for forty-two of those executions, and
+balances two residual streams with a routing matrix that is deliberately not solved to
+convergence. The reference implementation builds a graph of eighty-four thousand nodes for a
+single decoded token, and it runs at five tokens per second on hardware whose memory bandwidth
+would support twenty-five.
+
+The measurements that follow ask three questions. How many nodes does the engine really reserve
+per token? How many device launches does it really issue? And how much of the machine is idle
+while the host is busy? If the answer to the third question is "most of it", the correct fix is
+not a cleverer kernel, a smaller quantisation, or a faster allocator. The correct fix is to stop
+compiling the program per token, and to compile it once, at load time, with every pointer already
+known. That is the thesis of the project this document introduces.
+
+A note on method. Every number in this document is produced by a command line that is printed
+next to it, and every command line is checked into the repository alongside the number. Where a
+measurement cannot be reproduced on the machine that reads this document, the reason is stated.
+Where a number is an estimate rather than a measurement, it is labelled as an estimate. Adjectives
+are not results: "faster" is not a status, and neither is "optimised". A result is a pair of
+numbers, before and after, with the same input, the same seed, and the same hardware.
+
+--- Passage 3 ---
+The history of stored-program computers begins with machines whose programs were the wiring.
+The ENIAC of 1945 was reprogrammed by moving cables and setting switches, and a single
+change of problem could take a team of operators several days. The idea that a program could
+be written in the same memory as the data it transforms — the stored-program concept, drafted
+in the First Draft of a Report on the EDVAC by John von Neumann and colleagues in 1945 —
+removed that constraint, and with it removed the distinction between a machine that computes
+trajectories and a machine that sorts names. Everything after that is engineering in the shadow
+of that one idea.
+
+Two engineering problems have shadowed every generation of hardware since. The first is that
+arithmetic got cheap faster than movement got cheap. A modern GPU can perform a trillion
+floating-point operations per second while a single stream of memory reads stalls for hundreds
+of cycles; a decoder that walks a long list of small operations, issuing each one separately,
+will spend most of its clock waiting for the host to tell it what to do next. The second is
+that the programs we most want to run are recurrent. A language model that re-reads its own
+weights several times per token, or that keeps a persistent state across tokens, multiplies the
+movement problem rather than the arithmetic problem, and it does so in exactly the place where
+a generic runtime, which counts nodes and rebuilds plans, is least willing to help.
+
+This document measures both problems in a concrete system: an inference engine for a
+looped-transformer language model with a hybrid attention stack, running on a laptop-class
+RDNA3 GPU with eight gigabytes of memory. The model executes thirty-two physical blocks fifty-six
+times per token, keeps gated-deltanet recurrent state for forty-two of those executions, and
+balances two residual streams with a routing matrix that is deliberately not solved to
+convergence. The reference implementation builds a graph of eighty-four thousand nodes for a
+single decoded token, and it runs at five tokens per second on hardware whose memory bandwidth
+would support twenty-five.
+
+The measurements that follow ask three questions. How many nodes does the engine really reserve
+per token? How many device launches does it really issue? And how much of the machine is idle
+while the host is busy? If the answer to the third question is "most of it", the correct fix is
+not a cleverer kernel, a smaller quantisation, or a faster allocator. The correct fix is to stop
+compiling the program per token, and to compile it once, at load time, with every pointer already
+known. That is the thesis of the project this document introduces.
+
+A note on method. Every number in this document is produced by a command line that is printed
+next to it, and every command line is checked into the repository alongside the number. Where a
+measurement cannot be reproduced on the machine that reads this document, the reason is stated.
+Where a number is an estimate rather than a measurement, it is labelled as an estimate. Adjectives
+are not results: "faster" is not a status, and neither is "optimised". A result is a pair of
+numbers, before and after, with the same input, the same seed, and the same hardware.
+
+--- Passage 4 ---
+The history of stored-program computers begins with machines whose programs were the wiring.
+The ENIAC of 1945 was reprogrammed by moving cables and setting switches, and a single
+change of problem could take a team of operators several days. The idea that a program could
+be written in the same memory as the data it transforms — the stored-program concept, drafted
+in the First Draft of a Report on the EDVAC by John von Neumann and colleagues in 1945 —
+removed that constraint, and with it removed the distinction between a machine that computes
+trajectories and a machine that sorts names. Everything after that is engineering in the shadow
+of that one idea.
+
+Two engineering problems have shadowed every generation of hardware since. The first is that
+arithmetic got cheap faster than movement got cheap. A modern GPU can perform a trillion
+floating-point operations per second while a single stream of memory reads stalls for hundreds
+of cycles; a decoder that walks a long list of small operations, issuing each one separately,
+will spend most of its clock waiting for the host to tell it what to do next. The second is
+that the programs we most want to run are recurrent. A language model that re-reads its own
+weights several times per token, or that keeps a persistent state across tokens, multiplies the
+movement problem rather than the arithmetic problem, and it does so in exactly the place where
+a generic runtime, which counts nodes and rebuilds plans, is least willing to help.
+
+This document measures both problems in a concrete system: an inference engine for a
+looped-transformer language model with a hybrid attention stack, running on a laptop-class
+RDNA3 GPU with eight gigabytes of memory. The model executes thirty-two physical blocks fifty-six
+times per token, keeps gated-deltanet recurrent state for forty-two of those executions, and
+balances two residual streams with a routing matrix that is deliberately not solved to
+convergence. The reference implementation builds a graph of eighty-four thousand nodes for a
+single decoded token, and it runs at five tokens per second on hardware whose memory bandwidth
+would support twenty-five.
+
+The measurements that follow ask three questions. How many nodes does the engine really reserve
+per token? How many device launches does it really issue? And how much of the machine is idle
+while the host is busy? If the answer to the third question is "most of it", the correct fix is
+not a cleverer kernel, a smaller quantisation, or a faster allocator. The correct fix is to stop
+compiling the program per token, and to compile it once, at load time, with every pointer already
+known. That is the thesis of the project this document introduces.
+
+A note on method. Every number in this document is produced by a command line that is printed
+next to it, and every command line is checked into the repository alongside the number. Where a
+measurement cannot be reproduced on the machine that reads this document, the reason is stated.
+Where a number is an estimate rather than a measurement, it is labelled as an estimate. Adjectives
+are not results: "faster" is not a status, and neither is "optimised". A result is a pair of
+numbers, before and after, with the same input, the same seed, and the same hardware.
+
+--- Passage 5 ---
+The history of stored-program computers begins with machines whose programs were the wiring.
+The ENIAC of 1945 was reprogrammed by moving cables and setting switches, and a single
+change of problem could take a team of operators several days. The idea that a program could
+be written in the same memory as the data it transforms — the stored-program concept, drafted
+in the First Draft of a Report on the EDVAC by John von Neumann and colleagues in 1945 —
+removed that constraint, and with it removed the distinction between a machine that computes
+trajectories and a machine that sorts names. Everything after that is engineering in the shadow
+of that one idea.
+
+Two engineering problems have shadowed every generation of hardware since. The first is that
+arithmetic got cheap faster than movement got cheap. A modern GPU can perform a trillion
+floating-point operations per second while a single stream of memory reads stalls for hundreds
+of cycles; a decoder that walks a long list of small operations, issuing each one separately,
+will spend most of its clock waiting for the host to tell it what to do next. The second is
+that the programs we most want to run are recurrent. A language model that re-reads its own
+weights several times per token, or that keeps a persistent state across tokens, multiplies the
+movement problem rather than the arithmetic problem, and it does so in exactly the place where
+a generic runtime, which counts nodes and rebuilds plans, is least willing to help.
+
+This document measures both problems in a concrete system: an inference engine for a
+looped-transformer language model with a hybrid attention stack, running on a laptop-class
+RDNA3 GPU with eight gigabytes of memory. The model executes thirty-two physical blocks fifty-six
+times per token, keeps gated-deltanet recurrent state for forty-two of those executions, and
+balances two residual streams with a routing matrix that is deliberately not solved to
+convergence. The reference implementation builds a graph of eighty-four thousand nodes for a
+single decoded token, and it runs at five tokens per second on hardware whose memory bandwidth
+would support twenty-five.
+
+The measurements that follow ask three questions. How many nodes does the engine really reserve
+per token? How many device launches does it really issue? And how much of the machine is idle
+while the host is busy? If the answer to the third question is "most of it", the correct fix is
+not a cleverer kernel, a smaller quantisation, or a faster allocator. The correct fix is to stop
+compiling the program per token, and to compile it once, at load time, with every pointer already
+known. That is the thesis of the project this document introduces.
+
+A note on method. Every number in this document is produced by a command line that is printed
+next to it, and every command line is checked into the repository alongside the number. Where a
+measurement cannot be reproduced on the machine that reads this document, the reason is stated.
+Where a number is an estimate rather than a measurement, it is labelled as an estimate. Adjectives
+are not results: "faster" is not a status, and neither is "optimised". A result is a pair of
+numbers, before and after, with the same input, the same seed, and the same hardware.
+
+--- Passage 6 ---
+The history of stored-program computers begins with machines whose programs were the wiring.
+The ENIAC of 1945 was reprogrammed by moving cables and setting switches, and a single
+change of problem could take a team of operators several days. The idea that a program could
+be written in the same memory as the data it transforms — the stored-program concept, drafted
+in the First Draft of a Report on the EDVAC by John von Neumann and colleagues in 1945 —
+removed that constraint, and with it removed the distinction between a machine that computes
+trajectories and a machine that sorts names. Everything after that is engineering in the shadow
+of that one idea.
+
+Two engineering problems have shadowed every generation of hardware since. The first is that
+arithmetic got cheap faster than movement got cheap. A modern GPU can perform a trillion
+floating-point operations per second while a single stream of memory reads stalls for hundreds
+of cycles; a decoder that walks a long list of small operations, issuing each one separately,
+will spend most of its clock waiting for the host to tell it what to do next. The second is
+that the programs we most want to run are recurrent. A language model that re-reads its own
+weights several times per token, or that keeps a persistent state across tokens, multiplies the
+movement problem rather than the arithmetic problem, and it does so in exactly the place where
+a generic runtime, which counts nodes and rebuilds plans, is least willing to help.
+
+This document measures both problems in a concrete system: an inference engine for a
+looped-transformer language model with a hybrid attention stack, running on a laptop-class
+RDNA3 GPU with eight gigabytes of memory. The model executes thirty-two physical blocks fifty-six
+times per token, keeps gated-deltanet recurrent state for forty-two of those executions, and
+balances two residual streams with a routing matrix that is deliberately not solved to
+convergence. The reference implementation builds a graph of eighty-four thousand nodes for a
+single decoded token, and it runs at five tokens per second on hardware whose memory bandwidth
+would support twenty-five.
+
+The measurements that follow ask three questions. How many nodes does the engine really reserve
+per token? How many device launches does it really issue? And how much of the machine is idle
+while the host is busy? If the answer to the third question is "most of it", the correct fix is
+not a cleverer kernel, a smaller quantisation, or a faster allocator. The correct fix is to stop
+compiling the program per token, and to compile it once, at load time, with every pointer already
+known. That is the thesis of the project this document introduces.
+
+A note on method. Every number in this document is produced by a command line that is printed
+next to it, and every command line is checked into the repository alongside the number. Where a
+measurement cannot be reproduced on the machine that reads this document, the reason is stated.
+Where a number is an estimate rather than a measurement, it is labelled as an estimate. Adjectives
+are not results: "faster" is not a status, and neither is "optimised". A result is a pair of
+numbers, before and after, with the same input, the same seed, and the same hardware.
+
+--- Passage 7 ---
+The history of stored-program computers begins with machines whose programs were the wiring.
+The ENIAC of 1945 was reprogrammed by moving cables and setting switches, and a single
+change of problem could take a team of operators several days. The idea that a program could
+be written in the same memory as the data it transforms — the stored-program concept, drafted
+in the First Draft of a Report on the EDVAC by John von Neumann and colleagues in 1945 —
+removed that constraint, and with it removed the distinction between a machine that computes
+trajectories and a machine that sorts names. Everything after that is engineering in the shadow
+of that one idea.
+
+Two engineering problems have shadowed every generation of hardware since. The first is that
+arithmetic got cheap faster than movement got cheap. A modern GPU can perform a trillion
+floating-point operations per second while a single stream of memory reads stalls for hundreds
+of cycles; a decoder that walks a long list of small operations, issuing each one separately,
+will spend most of its clock waiting for the host to tell it what to do next. The second is
+that the programs we most want to run are recurrent. A language model that re-reads its own
+weights several times per token, or that keeps a persistent state across tokens, multiplies the
+movement problem rather than the arithmetic problem, and it does so in exactly the place where
+a generic runtime, which counts nodes and rebuilds plans, is least willing to help.
+
+This document measures both problems in a concrete system: an inference engine for a
+looped-transformer language model with a hybrid attention stack, running on a laptop-class
+RDNA3 GPU with eight gigabytes of memory. The model executes thirty-two physical blocks fifty-six
+times per token, keeps gated-deltanet recurrent state for forty-two of those executions, and
+balances two residual streams with a routing matrix that is deliberately not solved to
+convergence. The reference implementation builds a graph of eighty-four thousand nodes for a
+single decoded token, and it runs at five tokens per second on hardware whose memory bandwidth
+would support twenty-five.
+
+The measurements that follow ask three questions. How many nodes does the engine really reserve
+per token? How many device launches does it really issue? And how much of the machine is idle
+while the host is busy? If the answer to the third question is "most of it", the correct fix is
+not a cleverer kernel, a smaller quantisation, or a faster allocator. The correct fix is to stop
+compiling the program per token, and to compile it once, at load time, with every pointer already
+known. That is the thesis of the project this document introduces.
+
+A note on method. Every number in this document is produced by a command line that is printed
+next to it, and every command line is checked into the repository alongside the number. Where a
+measurement cannot be reproduced on the machine that reads this document, the reason is stated.
+Where a number is an estimate rather than a measurement, it is labelled as an estimate. Adjectives
+are not results: "faster" is not a status, and neither is "optimised". A result is a pair of
+numbers, before and after, with the same input, the same seed, and the same hardware.
+
+--- Passage 8 ---
+The history of stored-program computers begins with machines whose programs were the wiring.
+The ENIAC of 1945 was reprogrammed by moving cables and setting switches, and a single
+change of problem could take a team of operators several days. The idea that a program could
+be written in the same memory as the data it transforms — the stored-program concept, drafted
+in the First Draft of a Report on the EDVAC by John von Neumann and colleagues in 1945 —
+removed that constraint, and with it removed the distinction between a machine that computes
+trajectories and a machine that sorts names. Everything after that is engineering in the shadow
+of that one idea.
+
+Two engineering problems have shadowed every generation of hardware since. The first is that
+arithmetic got cheap faster than movement got cheap. A modern GPU can perform a trillion
+floating-point operations per second while a single stream of memory reads stalls for hundreds
+of cycles; a decoder that walks a long list of small operations, issuing each one separately,
+will spend most of its clock waiting for the host to tell it what to do next. The second is
+that the programs we most want to run are recurrent. A language model that re-reads its own
+weights several times per token, or that keeps a persistent state across tokens, multiplies the
+movement problem rather than the arithmetic problem, and it does so in exactly the place where
+a generic runtime, which counts nodes and rebuilds plans, is least willing to help.
+
+This document measures both problems in a concrete system: an inference engine for a
+looped-transformer language model with a hybrid attention stack, running on a laptop-class
+RDNA3 GPU with eight gigabytes of memory. The model executes thirty-two physical blocks fifty-six
+times per token, keeps gated-deltanet recurrent state for forty-two of those executions, and
+balances two residual streams with a routing matrix that is deliberately not solved to
+convergence. The reference implementation builds a graph of eighty-four thousand nodes for a
+single decoded token, and it runs at five tokens per second on hardware whose memory bandwidth
+would support twenty-five.
+
+The measurements that follow ask three questions. How many nodes does the engine really reserve
+per token? How many device launches does it really issue? And how much of the machine is idle
+while the host is busy? If the answer to the third question is "most of it", the correct fix is
+not a cleverer kernel, a smaller quantisation, or a faster allocator. The correct fix is to stop
+compiling the program per token, and to compile it once, at load time, with every pointer already
+known. That is the thesis of the project this document introduces.
+
+A note on method. Every number in this document is produced by a command line that is printed
+next to it, and every command line is checked into the repository alongside the number. Where a
+measurement cannot be reproduced on the machine that reads this document, the reason is stated.
+Where a number is an estimate rather than a measurement, it is labelled as an estimate. Adjectives
+are not results: "faster" is not a status, and neither is "optimised". A result is a pair of
+numbers, before and after, with the same input, the same seed, and the same hardware.
+
+--- Passage 9 ---
+The history of stored-program computers begins with machines whose programs were the wiring.
+The ENIAC of 1945 was reprogrammed by moving cables and setting switches, and a single
+change of problem could take a team of operators several days. The idea that a program could
+be written in the same memory as the data it transforms — the stored-program concept, drafted
+in the First Draft of a Report on the EDVAC by John von Neumann and colleagues in 1945 —
+removed that constraint, and with it removed the distinction between a machine that computes
+trajectories and a machine that sorts names. Everything after that is engineering in the shadow
+of that one idea.
+
+Two engineering problems have shadowed every generation of hardware since. The first is that
+arithmetic got cheap faster than movement got cheap. A modern GPU can perform a trillion
+floating-point operations per second while a single stream of memory reads stalls for hundreds
+of cycles; a decoder that walks a long list of small operations, issuing each one separately,
+will spend most of its clock waiting for the host to tell it what to do next. The second is
+that the programs we most want to run are recurrent. A language model that re-reads its own
+weights several times per token, or that keeps a persistent state across tokens, multiplies the
+movement problem rather than the arithmetic problem, and it does so in exactly the place where
+a generic runtime, which counts nodes and rebuilds plans, is least willing to help.
+
+This document measures both problems in a concrete system: an inference engine for a
+looped-transformer language model with a hybrid attention stack, running on a laptop-class
+RDNA3 GPU with eight gigabytes of memory. The model executes thirty-two physical blocks fifty-six
+times per token, keeps gated-deltanet recurrent state for forty-two of those executions, and
+balances two residual streams with a routing matrix that is deliberately not solved to
+convergence. The reference implementation builds a graph of eighty-four thousand nodes for a
+single decoded token, and it runs at five tokens per second on hardware whose memory bandwidth
+would support twenty-five.
+
+The measurements that follow ask three questions. How many nodes does the engine really reserve
+per token? How many device launches does it really issue? And how much of the machine is idle
+while the host is busy? If the answer to the third question is "most of it", the correct fix is
+not a cleverer kernel, a smaller quantisation, or a faster allocator. The correct fix is to stop
+compiling the program per token, and to compile it once, at load time, with every pointer already
+known. That is the thesis of the project this document introduces.
+
+A note on method. Every number in this document is produced by a command line that is printed
+next to it, and every command line is checked into the repository alongside the number. Where a
+measurement cannot be reproduced on the machine that reads this document, the reason is stated.
+Where a number is an estimate rather than a measurement, it is labelled as an estimate. Adjectives
+are not results: "faster" is not a status, and neither is "optimised". A result is a pair of
+numbers, before and after, with the same input, the same seed, and the same hardware.
+
+--- Passage 10 ---
+The history of stored-program computers begins with machines whose programs were the wiring.
+The ENIAC of 1945 was reprogrammed by moving cables and setting switches, and a single
+change of problem could take a team of operators several days. The idea that a program could
+be written in the same memory as the data it transforms — the stored-program concept, drafted
+in the First Draft of a Report on the EDVAC by John von Neumann and colleagues in 1945 —
+removed that constraint, and with it removed the distinction between a machine that computes
+trajectories and a machine that sorts names. Everything after that is engineering in the shadow
+of that one idea.
+
+Two engineering problems have shadowed every generation of hardware since. The first is that
+arithmetic got cheap faster than movement got cheap. A modern GPU can perform a trillion
+floating-point operations per second while a single stream of memory reads stalls for hundreds
+of cycles; a decoder that walks a long list of small operations, issuing each one separately,
+will spend most of its clock waiting for the host to tell it what to do next. The second is
+that the programs we most want to run are recurrent. A language model that re-reads its own
+weights several times per token, or that keeps a persistent state across tokens, multiplies the
+movement problem rather than the arithmetic problem, and it does so in exactly the place where
+a generic runtime, which counts nodes and rebuilds plans, is least willing to help.
+
+This document measures both problems in a concrete system: an inference engine for a
+looped-transformer language model with a hybrid attention stack, running on a laptop-class
+RDNA3 GPU with eight gigabytes of memory. The model executes thirty-two physical blocks fifty-six
+times per token, keeps gated-deltanet recurrent state for forty-two of those executions, and
+balances two residual streams with a routing matrix that is deliberately not solved to
+convergence. The reference implementation builds a graph of eighty-four thousand nodes for a
+single decoded token, and it runs at five tokens per second on hardware whose memory bandwidth
+would support twenty-five.
+
+The measurements that follow ask three questions. How many nodes does the engine really reserve
+per token? How many device launches does it really issue? And how much of the machine is idle
+while the host is busy? If the answer to the third question is "most of it", the correct fix is
+not a cleverer kernel, a smaller quantisation, or a faster allocator. The correct fix is to stop
+compiling the program per token, and to compile it once, at load time, with every pointer already
+known. That is the thesis of the project this document introduces.
+
+A note on method. Every number in this document is produced by a command line that is printed
+next to it, and every command line is checked into the repository alongside the number. Where a
+measurement cannot be reproduced on the machine that reads this document, the reason is stated.
+Where a number is an estimate rather than a measurement, it is labelled as an estimate. Adjectives
+are not results: "faster" is not a status, and neither is "optimised". A result is a pair of
+numbers, before and after, with the same input, the same seed, and the same hardware.
+
+--- Passage 11 ---
+The history of stored-program computers begins with machines whose programs were the wiring.
+The ENIAC of 1945 was reprogrammed by moving cables and setting switches, and a single
+change of problem could take a team of operators several days. The idea that a program could
+be written in the same memory as the data it transforms — the stored-program concept, drafted
+in the First Draft of a Report on the EDVAC by John von Neumann and colleagues in 1945 —
+removed that constraint, and with it removed the distinction between a machine that computes
+trajectories and a machine that sorts names. Everything after that is engineering in the shadow
+of that one idea.
+
+Two engineering problems have shadowed every generation of hardware since. The first is that
+arithmetic got cheap faster than movement got cheap. A modern GPU can perform a trillion
+floating-point operations per second while a single stream of memory reads stalls for hundreds
+of cycles; a decoder that walks a long list of small operations, issuing each one separately,
+will spend most of its clock waiting for the host to tell it what to do next. The second is
+that the programs we most want to run are recurrent. A language model that re-reads its own
+weights several times per token, or that keeps a persistent state across tokens, multiplies the
+movement problem rather than the arithmetic problem, and it does so in exactly the place where
+a generic runtime, which counts nodes and rebuilds plans, is least willing to help.
+
+This document measures both problems in a concrete system: an inference engine for a
+looped-transformer language model with a hybrid attention stack, running on a laptop-class
+RDNA3 GPU with eight gigabytes of memory. The model executes thirty-two physical blocks fifty-six
+times per token, keeps gated-deltanet recurrent state for forty-two of those executions, and
+balances two residual streams with a routing matrix that is deliberately not solved to
+convergence. The reference implementation builds a graph of eighty-four thousand nodes for a
+single decoded token, and it runs at five tokens per second on hardware whose memory bandwidth
+would support twenty-five.
+
+The measurements that follow ask three questions. How many nodes does the engine really reserve
+per token? How many device launches does it really issue? And how much of the machine is idle
+while the host is busy? If the answer to the third question is "most of it", the correct fix is
+not a cleverer kernel, a smaller quantisation, or a faster allocator. The correct fix is to stop
+compiling the program per token, and to compile it once, at load time, with every pointer already
+known. That is the thesis of the project this document introduces.
+
+A note on method. Every number in this document is produced by a command line that is printed
+next to it, and every command line is checked into the repository alongside the number. Where a
+measurement cannot be reproduced on the machine that reads this document, the reason is stated.
+Where a number is an estimate rather than a measurement, it is labelled as an estimate. Adjectives
+are not results: "faster" is not a status, and neither is "optimised". A result is a pair of
+numbers, before and after, with the same input, the same seed, and the same hardware.
