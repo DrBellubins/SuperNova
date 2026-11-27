@@ -45,7 +45,14 @@ use crate::{human, Substrate};
 /// launch (the GDN decode + gated norm, the conv + L2 norm, RoPE in the Q/K producer), not the ones
 /// that only remove a node. Each is decided by measurement here, not by the §6 P2 list.
 pub fn launchable_fusion() -> Fusion {
-    Fusion::RAW
+    let mut f = Fusion::RAW;
+    // `ffn_gate` + `ffn_up` in one launch: 56 fewer nodes per token, and (measured, `sn run
+    // --bench 30 --ctx 8192`: 51.69 -> 50.74 ms/token) 0.95 ms *faster*, because one launch drives
+    // 24 576 rows instead of two launches driving 12 288 each - the tail waves of a launch are the
+    // part that was not streaming weights. It changes no arithmetic: same rows, same order, same
+    // values, and `sn gpu gemm` asserts the pair is bit-identical to the two single launches.
+    f.multi_gemv = true;
+    f
 }
 
 /// What to size the engine for.
@@ -173,9 +180,15 @@ impl Engine {
         }
 
         // ---- compile + capture ------------------------------------------------------------
-        let resolve = |name: &str| -> Result<(u64, String)> {
+        // The weight resolver returns the offset **inside the device slab**, not the GGUF offset:
+        // the slab stores Q6_K super-blocks padded to 224 bytes (`Substrate::upload_weights`), so
+        // every tensor after the first Q6_K one has moved. Baking the GGUF offset instead is the
+        // silent kind of wrong - the head reads a shifted Q6_K matrix and the logits come out NaN
+        // (found the same day the repack landed, by `--ref-tokens 1`).
+        let wmap = sub.weight_offsets().clone();
+        let resolve = move |name: &str| -> Result<(u64, String)> {
             let t = g.tensor(name)?;
-            Ok((t.offset, sn_core::qtypes::name(t.ty).to_string()))
+            Ok((*wmap.get(&t.offset).unwrap_or(&t.offset), sn_core::qtypes::name(t.ty).to_string()))
         };
         let bases = Bases {
             activations: sub.activations()?.addr(),
@@ -428,21 +441,36 @@ impl Engine {
     }
 
     /// Clear one sequence's caches: KV by resetting its length (append-only storage needs no
-    /// zeroing - a row is unread until it is written), GDN state by zeroing the slab regions.
+    /// zeroing - a row is unread until it is written), GDN state by zeroing **that sequence's**
+    /// regions with `Slab::clear_range`.
+    ///
+    /// The GDN state cannot be treated like the KV cache: the recurrence reads the state before it
+    /// writes it, so a row that was never written still contributes whatever is in memory. Zeroing
+    /// is required, and it has to be per-sequence - the blunt whole-slab `hipMemset` this replaced
+    /// (a) cost 88 MB per call per sequence and (b) wiped every other sequence's state while only
+    /// resetting one session, which is a wrong-answer bug the moment `n_seq > 1`.
     pub fn reset(&mut self, seq: usize) -> Result<()> {
-        let mut z = Vec::new();
-        for &ex in &self.cache_layout.gdn_exec {
-            let st = self.cache_layout.state(ex, seq)?;
-            let cv = self.cache_layout.conv(ex, seq)?;
-            let g = self.cache_layout.geom.as_ref().unwrap();
-            self.sub.caches()?.zero(&self.dev_api())?;
-            z.push((st, g.state_bytes()));
-            z.push((cv, g.conv_bytes()));
+        let n = self.cache_layout.geom.as_ref().map(|g| g.n_seq).unwrap_or(1);
+        if seq >= n {
+            return Err(Error::msg(format!("reset: sequence {seq} of {n}")));
         }
-        // Zeroing the whole slab is the blunt version; with several sequences that is wasteful but
-        // never wrong. `Slab::clear_range` is the Phase 7 refinement.
-        let _ = z;
-        self.sessions = Sessions::new(self.seqs.len(), self.cache_layout.geom.as_ref().map(|g| g.n_snap).unwrap_or(0));
+        {
+            let (cache, g) = (self.sub.caches()?, self.cache_layout.geom.as_ref().unwrap());
+            let (sb, cb) = (g.state_bytes(), g.conv_bytes());
+            for &ex in &self.cache_layout.gdn_exec {
+                let st = self.cache_layout.state(ex, seq)?;
+                let cv = self.cache_layout.conv(ex, seq)?;
+                cache.clear_range(&self.dev_api(), st, sb)?;
+                cache.clear_range(&self.dev_api(), cv, cb)?;
+            }
+        }
+        self.sessions.reset(seq)?;
+        // Publish the new length immediately: the pinned meta rows are what the program reads, and a
+        // caller who resets and then launches without staging must not run against the old length.
+        let meta = self.sessions.meta_bytes();
+        let p = self.sub.io_mut().ok_or_else(|| Error::msg("no pinned slot"))?;
+        let b = p.as_mut_bytes();
+        b[decode::PIN_META..decode::PIN_META + meta.len()].copy_from_slice(&meta);
         Ok(())
     }
 }
@@ -463,9 +491,12 @@ fn argmax(v: &[f32]) -> usize {
 /// tokenizer (`Tools/tok`); the GGUF BPE tokenizer is Phase 10 work.
 pub fn read_ids(path: &str) -> Result<Vec<u32>> {
     let text = std::fs::read_to_string(path)?;
+    // The `.ids` files `Tools/tok` writes are one comma-separated line, so splitting on whitespace
+    // alone returns one unparseable token (and an empty prompt, which is an error rather than a
+    // wrong answer - but only if the caller checks).
     Ok(text
-        .split_whitespace()
-        .filter_map(|t| t.trim_matches(',').parse::<u32>().ok())
+        .split([',', ' ', '\n', '\r', '\t'])
+        .filter_map(|t| t.trim().parse::<u32>().ok())
         .collect())
 }
 

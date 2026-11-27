@@ -625,7 +625,7 @@ fusion alone.** All numbers: `Docs/bench.md` §2.
   that Phase 5/6 have not written yet. `SN_TRACE` over the real step belongs to Phase 7, where the plan
   already asks for it (≤ 300 ops visible there).
 
-### Phase 5 · Quantised matmul for Q4_K / Q6_K / f32 (5–8 days) — the bandwidth half — **kernels and gates DONE 2026-11-27, two throughput gates NOT met**
+### Phase 5 · Quantised matmul for Q4_K / Q6_K / f32 (5–8 days) — the bandwidth half — **kernels and gates DONE 2026-11-27; GEMV bandwidth met for both quant classes after Phase 7b, the WMMA/GEMM throughput line still open**
 Decode (T=1) path first: memory‑bound `gemv`, warp‑per‑superblock, `__builtin_amdgcn_` 16‑bit packed ops for the
 4/6‑bit unpack (`Q4_K` + `Q6_K` are the only quantised types in the checkpoint), 128‑byte loads, one pass, f32
 accumulate, no smem staging; block sizes tuned on gfx1102's **32 CUs** (KFD `simd_count 64 / simd_per_cu 2`,
@@ -655,7 +655,9 @@ out of the GGUF, the picks, the gates and the report; `sn gpu gemm` / `sn bench 
  in a row is vector-aligned and unaligned vector loads on GCN are undefined, not checked (it returned NMSE 4e16, not
  a fault). The fix is a staging decision for Phase 6: pad Q6_K super-blocks to 224 B in the weight arena (6.7 % of
  those bytes at upload), which changes the "tensor address = base + gguf offset" contract of §1.3 and would silently
- move the decode program's baked addresses.*
+ move the decode program's baked addresses.* **(Closed in Phase 7b, `Docs/bench.md` §6.1-§6.2: the
+ device slab does pad to 224 B, the map lives in `Substrate`, and Q6_K GEMV is now 200-230 GB/s —
+ `ffn_down` at 82 % of the read reference, so this gate is met for both quant classes.)**
  * **`gemm(512)` ≥ 60 % of WMMA peak: NOT EVALUABLE, and not met against any other reference either.** The WMMA
  builtin compiles for gfx1102 (and must be `#if defined(__gfx11__)`-guarded: the fatbin is built for gfx1035 too) but
  the probe implies 4.8e-4 ns per 16×16×16 op per wavefront — under one cycle — so its FLOP/s is not a machine peak.
@@ -710,7 +712,7 @@ naive causal attention (one workgroup per (head, tile), smem K/V tiles). Full pr
 **Gate:** logits NMSE ≤ 1e‑4 vs Phase 2 reference at token 1, 8, 64; greedy continuation identical to the fork for
 the 5 golden prompts; `n_seq=2` with divergent prefixes gives the same result as two separate runs.
 
-### Phase 7 · Decode fast path (4–6 days) — **profiled and half-closed 2026-11-27: 10.9 → 15.6 t/s, one graph launch and zero copies per token; ≥ 20 t/s and ≤ 300 ops NOT met**
+### Phase 7 · Decode fast path (4–6 days) — **closed 2026-11-27 (7 + 7b): 10.9 → 19.3 t/s, one graph launch and zero copies per token, `n_seq=2` gate met; ≥ 20 t/s and ≤ 300 ops NOT met**
 
 *Status. The static program, the baked pointers, the one `hipGraph` per sequence and the pinned
 token/pos/cache-length path are all in place and were already true at the end of Phase 6. What this
@@ -737,6 +739,41 @@ per token while making the forward worse. `launchable_fusion()` is now `Fusion::
   millisecond.
 * Not done: the ≤ 300 op count; the fused-pair kernels named above; a `Slab::clear_range` for
   `Engine::reset`; the `n_seq=2` gate.
+
+**Phase 7b (same day) — all four items taken; numbers in `Docs/bench.md` §6.**
+
+* **(a) done, and it was the real one.** The weight slab now stores Q6_K super-blocks **padded to
+  224 bytes** (`dq::Q6K_BLOCK_PADDED` / `dq::q6k_pad`, sized by `dq::device_size`, applied by
+  `Substrate::upload_weights` and `gemm::upload_shapes`), and `sn_gemv_q6_k` was rewritten in the
+  shape `sn_gemv_q4_k` already had (a wavefront per four super-blocks, one `uint4` per lane = 32
+  values). Q6_K GEMV: **102‑108 → 200‑230 GB/s**, `ffn_down` at **82 %** of the read reference —
+  the Phase 5 gate, met. In-graph GEMV: **149 → 200 GB/s**; the token 62.9 → 51.7 ms. Cost: +131 MB
+  and a `gguf offset → slab offset` map in `Substrate` (the "address = base + gguf offset" contract
+  of §1.3 is deliberately broken; baking the GGUF offset instead was a silent NaN‑logits bug, now
+  asserted against in `crates/sn-hip/tests/phase7.rs`).
+* **(b) done as far as it is possible.** `sn_gemv_q4_k_pair` batches `ffn_gate`+`ffn_up` (the only
+  pair that is the same type and shape in every block): **56 fewer launches, 0.95 ms faster**, and
+  `launchable_fusion()` is `RAW` with `multi_gemv` on. `q+k+v` **cannot** be one kernel — `attn_v`
+  is Q6_K in five of the nine full-attention blocks — so the flag is split (`multi_gemv` /
+  `multi_qkv`) and the qkv rung stays pending. The other four (RoPE-in-producer, gate-in-`wo`,
+  SiLU-in-`ffn_down`, `mhc_merge_route`) are still pending names.
+* **The op-count arithmetic in (b) was wrong: the fused-pair kernels do not reach ≤ 300, and neither
+  does anything else in fusion.** 986 → **930** today; the full ladder is **629**, of which 267
+  weight multiplications, 154 recurrent inner kernels and 146 route/merge/seed/expose kernels are
+  one-per-thing by construction. 930 nodes is 2.7 ms of a 50.7 ms token at Phase 3's 2.9 µs per
+  node: the op count is not what limits decode. Meeting ≤ 300 needs fewer weight bytes and cache
+  regions per token, which is §7 Phase 9 (MTP), not fusion.
+* `Slab::clear_range` + `Sessions::reset` exist; `Engine::reset(seq)` now clears one sequence and
+  nothing else (it zeroed the whole cache slab per execution, which with `n_seq > 1` erased the
+  other sequences). The Phase 6 carry-over gate — **`n_seq = 2` with divergent prefixes gives the
+  same result as two separate runs — is run through real forwards and PASSES** (`tests/phase7.rs`:
+  two sequences, order swapped after a reset, compared token-for-token against a single-sequence
+  engine). `driver::read_ids` also splits commas, which the `.ids` files are written with.
+* **Gate: decode 19.28 t/s end-to-end / 19.71 graph-only** (target ≥ 20, from 15.6), correctness
+  *improved* to 3.3e‑12 logits NMSE and an unchanged greedy continuation, VRAM 6.901 GiB at
+  `n_ctx=32768` q8_0, `sn gpu gemm` 51 checks 0 failing, `cargo test --workspace` green, clippy 0.
+  **Both Phase 7 numeric gates are reported not met**: the last 2 ms/token is weight bytes at
+  200 GB/s, and the op count is bounded by the model's shape, not by this engine's fusions.
 
 ### Phase 8 · Prefill fast path (4–6 days)
 Chunked GDN prefill: replace the per‑token scan with the chunked/UT‑transform form (chunks of 64, matmul on

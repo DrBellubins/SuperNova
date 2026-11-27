@@ -46,8 +46,14 @@ pub struct Fusion {
     pub rope_into_gemv: bool,
     /// The `sigmoid(g) * attn_out` gate folded into `attn_output`'s GEMV prologue (plan Phase 7).
     pub gate_into_gemv: bool,
-    /// Weight matrices that share one input launched together: `q`+`k`+`v`, `ffn_gate`+`ffn_up`.
+    /// Weight matrices that share one input launched together: `ffn_gate`+`ffn_up` (Phase 7:
+    /// `sn_gemv_q4_k_pair`, a real kernel). Kept separate from `multi_qkv` because the two have
+    /// different feasibility: gate/up are the same type and shape in every block, q/k/v are not
+    /// (`attn_v` is Q6_K in five blocks), so a single "batch the GEMVs" switch would claim a
+    /// fusion the kernels cannot make.
     pub multi_gemv: bool,
+    /// The `q`+`k`+`v` triple in one launch. Still a pending name: see `multi_gemv`.
+    pub multi_qkv: bool,
 }
 
 impl Fusion {
@@ -60,6 +66,7 @@ impl Fusion {
         gate_into_gemv: false,
         rope_into_gemv: false,
         multi_gemv: false,
+        multi_qkv: false,
     };
     /// The §6 P2 target.
     pub const FUSED: Fusion = Fusion {
@@ -69,6 +76,7 @@ impl Fusion {
         gate_into_gemv: true,
         rope_into_gemv: true,
         multi_gemv: true,
+        multi_qkv: true,
     };
 
     /// The same preset with one fusion turned off, for the ladder.
@@ -81,18 +89,20 @@ impl Fusion {
             FusionFlag::Rope => f.rope_into_gemv = false,
             FusionFlag::Gate => f.gate_into_gemv = false,
             FusionFlag::Multi => f.multi_gemv = false,
+            FusionFlag::MultiQkv => f.multi_qkv = false,
         }
         f
     }
 
-    pub fn flags(&self) -> [(&'static str, bool); 6] {
+    pub fn flags(&self) -> [(&'static str, bool); 7] {
         [
             ("route+merge", self.route_with_merge),
             ("norm->gemv", self.norm_into_gemv),
             ("silu->gemv", self.silu_into_gemv),
             ("rope->gemv", self.rope_into_gemv),
             ("gate->gemv", self.gate_into_gemv),
-            ("multi-gemv", self.multi_gemv),
+            ("multi-gemv pair", self.multi_gemv),
+            ("multi-gemv qkv", self.multi_qkv),
         ]
     }
 }
@@ -106,6 +116,7 @@ pub enum FusionFlag {
     Rope,
     Gate,
     Multi,
+    MultiQkv,
 }
 
 /// One planned launch.
@@ -629,7 +640,7 @@ fn compile_inner(
             )?;
         } else {
             // q (interleaved [q | gate]), k, v
-            if b.fusion.multi_gemv {
+            if b.fusion.multi_qkv {
                 b.push(
                     &format!("gemv qkv blk.{blk}"),
                     "gemv",
@@ -1170,6 +1181,67 @@ impl<'a> Builder<'a> {
         let d = self.slots.d;
         let ffn = self.n_ffn;
         if self.fusion.multi_gemv {
+            // Phase 7: this is no longer a name. `ffn_gate` and `ffn_up` are the one pair in this
+            // checkpoint that always shares an input *and* has identical shape and type in every
+            // block (`Tools/tensor_census.py`: 33 x q4_k each), which is what `sn_gemv_q4_k_pair`
+            // requires. If a file ever breaks that, fall back to two single launches rather than to
+            // a launch the kernel cannot serve.
+            let gate = format!("blk.{blk}.ffn_gate.weight");
+            let up = format!("blk.{blk}.ffn_up.weight");
+            let (g1, t1) = (self.weights)(&gate)?;
+            let (g2, t2) = (self.weights)(&up)?;
+            if t1 == "q4_k" && t2 == "q4_k" {
+                let wpr = crate::gemm::pick_warps(ffn, d, crate::gemm::PICK_CUS);
+                let norm_w = if self.fusion.norm_into_gemv {
+                    self.w(&format!("blk.{blk}.post_attention_norm.weight"))?
+                } else {
+                    Arg::U64(0)
+                };
+                self.push(
+                    &format!("gemv ffn_gate+up blk.{blk}"),
+                    "gemv",
+                    "gemv_q4_k_pair",
+                    false,
+                    crate::gemm::gemv_grid(2 * ffn, wpr),
+                    crate::ops::GEMV_BLOCK,
+                    0,
+                    vec![
+                        self.w_off(g1),
+                        self.w_off(g2),
+                        self.a(h),
+                        self.a(self.slots.ffn_g),
+                        self.a(self.slots.ffn_u),
+                        i(d),
+                        i(ffn),
+                        norm_w,
+                        Arg::F32(1e-6),
+                        i(wpr),
+                    ],
+                );
+                let act = if self.fusion.silu_into_gemv { self.slots.ffn_g } else { self.slots.ffn_act };
+                if !self.fusion.silu_into_gemv {
+                    self.push(
+                        &format!("silu_mul blk.{blk}"),
+                        "silu",
+                        "sn_silu_mul_f32",
+                        false,
+                        grid1d(ffn),
+                        BLOCK,
+                        0,
+                        vec![self.a(self.slots.ffn_g), self.a(self.slots.ffn_u), self.a(act), u(ffn)],
+                    );
+                }
+                return self.gemv(
+                    &format!("gemv ffn_down blk.{blk}"),
+                    &format!("blk.{blk}.ffn_down.weight"),
+                    act,
+                    self.slots.branch,
+                    ffn,
+                    d,
+                    None,
+                    blk,
+                );
+            }
             self.push(
                 &format!("gemv ffn_gate_up blk.{blk}"),
                 "gemv",
@@ -1241,9 +1313,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fusion_presets_differ_by_exactly_the_six_flags() {
+    fn fusion_presets_differ_by_exactly_the_seven_flags() {
         assert_ne!(Fusion::RAW, Fusion::FUSED);
-        assert_eq!(Fusion::FUSED.flags().iter().filter(|(_, on)| *on).count(), 6);
+        assert_eq!(Fusion::FUSED.flags().iter().filter(|(_, on)| *on).count(), 7);
         assert_eq!(Fusion::RAW.flags().iter().filter(|(_, on)| *on).count(), 0);
         let f = Fusion::FUSED.without(FusionFlag::Multi);
         assert!(!f.multi_gemv && f.norm_into_gemv);

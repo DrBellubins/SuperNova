@@ -114,9 +114,11 @@ fn phase5_decode_gemv_nodes_are_launchable_with_the_picked_geometry() {
     eprintln!("{}", spec.report());
     let gemvs: Vec<&decode::OpSpec> = spec.ops.iter().filter(|o| o.class == "gemv").collect();
     assert_eq!(gemvs.len(), 267, "the decode step multiplies 267 weight matrices");
-    // The per-tensor GEMVs are all launchable. What may stay pending is the *multi*-GEMV fusion
-    // rungs, which combine two or three weight matrices into one launch and are not implemented -
-    // naming them keeps "what is missing is countable" true after Phase 5.
+    // The per-tensor GEMVs are all launchable, and so is the one multi-GEMV fusion whose operands
+    // always match (`ffn_gate` + `ffn_up`: same type, same shape, in every block - Phase 7's
+    // `sn_gemv_q4_k_pair`). What may stay pending is the `q+k+v` triple, because `attn_v` is Q6_K in
+    // five blocks while q/k are Q4_K, so one entry point cannot serve all three. Naming the rest
+    // keeps "what is missing is countable" true.
     let still_pending: Vec<String> = gemvs.iter().filter(|o| o.pending).map(|o| o.kernel.clone()).collect();
     assert!(
         still_pending.iter().all(|k| k.starts_with("gemv_multi_")),
@@ -128,7 +130,23 @@ fn phase5_decode_gemv_nodes_are_launchable_with_the_picked_geometry() {
             u
         }
     );
-    assert_eq!(still_pending.len(), 70, "one qkv and one gate/up multi-GEMV per block, unimplemented");
+    assert_eq!(still_pending.len(), 14, "one qkv triple per full-attention block, still unimplemented (the gate/up pair is a real kernel since Phase 7)");
+    let pairs: Vec<&decode::OpSpec> = gemvs.iter().copied().filter(|o| o.kernel == "gemv_q4_k_pair").collect();
+    assert_eq!(pairs.len(), 56, "one gate/up pair launch per FFN execution");
+    for op in &pairs {
+        // (W1, W2, x, y1, y2, k, n, norm_w, eps, warps_per_row)
+        assert_eq!(op.args.len(), 10, "the pair GEMV ABI");
+        let (k, n) = match (&op.args[5], &op.args[6]) {
+            (sn_hip::program::Arg::I32(k), sn_hip::program::Arg::I32(n)) => (*k as usize, *n as usize),
+            _ => panic!("k and n must be ints"),
+        };
+        let wpr = match op.args[9] {
+            sn_hip::program::Arg::I32(v) => v as usize,
+            _ => panic!("warps_per_row must be an int"),
+        };
+        assert_eq!(wpr, gemm::pick_warps(n, k, gemm::PICK_CUS), "the pair's split is the policy's for one matrix");
+        assert_eq!(op.grid, gemm::gemv_grid(2 * n, wpr), "the pair's grid covers both matrices");
+    }
     for probe in ["gemv_q4_k", "gemv_q6_k", "gemv_f32"] {
         let op = gemvs.iter().find(|o| o.kernel == probe);
         match (probe, op) {

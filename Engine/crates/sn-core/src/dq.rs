@@ -91,19 +91,70 @@ pub fn f16_to_f32(h: u16) -> f32 {
 }
 
 /// Elements per K-quant super-block and bytes per super-block, for the types we can meet.
-const QK_K: usize = 256;
-const Q4K_BLOCK: usize = 144; // d:f16 dmin:f16 scales:12 qs:128
-const Q6K_BLOCK: usize = 210; // ql:128 qh:64 sc:16 d:f16
+pub const QK_K: usize = 256;
+pub const Q4K_BLOCK: usize = 144; // d:f16 dmin:f16 scales:12 qs:128
+pub const Q6K_BLOCK: usize = 210; // ql:128 qh:64 sc:16 d:f16
 
 // Field offsets inside a super-block (the format, not an implementation choice).
 const Q4K_D: usize = 0;
 const Q4K_DMIN: usize = 2;
 const Q4K_SCALES: usize = 4;
 const Q4K_QS: usize = 16;
-const Q6K_QL: usize = 0;
-const Q6K_QH: usize = 128;
-const Q6K_SC: usize = 192;
-const Q6K_D: usize = 208;
+pub const Q6K_QL: usize = 0;
+pub const Q6K_QH: usize = 128;
+pub const Q6K_SC: usize = 192;
+pub const Q6K_D: usize = 208;
+
+/// The Q6_K super-block stride the **device** weight slab uses: 224 bytes instead of 210.
+///
+/// Why the engine needs it (`Docs/bench.md` §3.2, §5.4): a super-block is 210 bytes, so rows of a
+/// Q6_K matrix start at offsets that are only 2-byte aligned (210 % 16 == 2) and *no* vector load
+/// inside one is aligned - unaligned vector loads on GCN are undefined, not checked (the first
+/// attempt at this returned NMSE 4e16 instead of faulting). Q6_K therefore ran at 102-108 GB/s
+/// where Q4_K reaches 222-239, and Q6_K is 1.97 GB of this checkpoint, including the 834 MB output
+/// head that every decoded token reads. Padding each super-block to 224 B (16 * 14) leaves every
+/// field at its existing offset and makes every super-block 16-byte aligned, so the kernel can load
+/// `ql` as eight `uint4`s exactly like Q4_K loads `qs`. The cost is 6.7 % of the Q6_K bytes at
+/// upload (+131 MB here) and one extra map from GGUF offset to slab offset, which `Substrate` keeps.
+pub const Q6K_BLOCK_PADDED: usize = 224;
+
+/// Bytes one Q6_K row occupies in the padded layout.
+pub fn q6k_row_bytes_padded(ne0: usize) -> usize {
+    ne0 / QK_K * Q6K_BLOCK_PADDED
+}
+
+/// Bytes a tensor occupies in the **device** weight slab. Identical to its GGUF `size` for every
+/// type except Q6_K, whose super-blocks are stored padded. Both places that build a device weight
+/// slab (`Substrate::upload_weights` for the engine, `gemm::upload_shapes` for the benches) size and
+/// copy through this, so a slab and a map cannot disagree about where a row starts.
+pub fn device_size(t: &TensorInfo) -> usize {
+    if t.ty == ty::Q6_K {
+        (t.n_elts() as usize / QK_K) * Q6K_BLOCK_PADDED
+    } else {
+        t.size as usize
+    }
+}
+
+/// Expand a whole Q6_K tensor from 210-byte super-blocks to 224-byte ones: copy 210 bytes, advance
+/// the destination by 224. Nothing is re-encoded, so `q6k_dequant`/`q6k_dot` read the padded form
+/// unchanged, which is what makes the padded kernel checkable against the same scalar oracle.
+pub fn q6k_pad(src: &[u8], dst: &mut [u8]) -> Result<usize> {
+    if src.len() % Q6K_BLOCK != 0 {
+        return Err(Error::msg(format!(
+            "q6k_pad: {} bytes is not a whole number of 210-byte super-blocks",
+            src.len()
+        )));
+    }
+    let n = src.len() / Q6K_BLOCK;
+    if dst.len() < n * Q6K_BLOCK_PADDED {
+        return Err(Error::msg(format!("q6k_pad: destination needs {} bytes, has {}", n * Q6K_BLOCK_PADDED, dst.len())));
+    }
+    for (from, to) in src.chunks_exact(Q6K_BLOCK).zip(dst.chunks_exact_mut(Q6K_BLOCK_PADDED)) {
+        to[..Q6K_BLOCK].copy_from_slice(from);
+        to[Q6K_BLOCK..].fill(0);
+    }
+    Ok(n * Q6K_BLOCK_PADDED)
+}
 
 /// A 2-D weight tensor in file layout: `ne0` input features contiguous, `ne1` output rows.
 ///

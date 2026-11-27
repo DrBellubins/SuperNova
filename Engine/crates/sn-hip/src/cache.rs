@@ -434,6 +434,22 @@ impl Sessions {
         self.active[seq]
     }
 
+    /// Forget one sequence: length back to 0, positions back to -1, every snapshot slot released.
+    /// The other sequences are untouched, which is the point - `Engine::reset(seq)` must not reset
+    /// the whole batch. The bytes are the caller's business (`Slab::clear_range` over that
+    /// sequence's GDN regions); KV rows are append-only and unread until written, so they need
+    /// nothing.
+    pub fn reset(&mut self, seq: usize) -> Result<()> {
+        if seq >= self.n_seq {
+            return Err(Error::msg(format!("reset: sequence {seq} of {}", self.n_seq)));
+        }
+        self.len[seq] = 0;
+        self.last_pos[seq] = -1;
+        self.snaps[seq].clear();
+        self.active[seq] = None;
+        Ok(())
+    }
+
     /// Append one token. `pos` is explicit: the engine may skip positions (mrope, gaps after a
     /// rollback), and the cache must not assume that row `n` belongs to position `n`.
     pub fn append(&mut self, seq: usize, pos: u32) -> Result<usize> {

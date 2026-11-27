@@ -651,3 +651,146 @@ device writes directly. `Engine::sampled()` reads four bytes after the sync. Tha
 `hipMemcpy` and a 248 320-element CPU pass from every decoded token, which is what made the CPU
 number above measurable at all. `Engine::logits()` (the copy) is still there, used only by
 `--ref-tokens` and `sn gpu stages`.
+
+---
+
+## 6. Phase 7b — closing the GEMV gap, and the op-count fusions that exist (2026-11-27)
+
+§5.4 named two things left: the Q6_K row (210-byte super-blocks, no vector-aligned load, 102-108
+GB/s) and the gap between the microbenchmark's 190-240 GB/s and the 149 GB/s the same kernels
+achieve inside a 986-node graph. Both were attacked; one more fusion was built because it was the
+only named op-count item that is actually implementable as written.
+
+### 6.1 The Q6_K repack: 210-byte super-blocks are a layout bug, not a format fact
+
+`crates/sn-core/src/dq.rs` now carries `Q6K_BLOCK_PADDED = 224` and `q6k_pad()`: the **device**
+weight slab stores Q6_K super-blocks 224 bytes apart (16 × 14), fields at their wire offsets. The
+GGUF's own layout is untouched, and no re-encoding happens — 210 bytes are copied verbatim and 14
+bytes of zero follow, which is what lets `dq::q6k_dequant` stay the oracle for the repacked kernel.
+Two uploaders implement it (`Substrate::upload_weights` for the engine, `gemm::upload_shapes` for the
+benches) and size everything through `dq::device_size`, so the slab and the map cannot disagree.
+
+That breaks the Phase 3 contract "tensor address = base + GGUF offset", so `Substrate` keeps a map
+`gguf offset -> slab offset` and `weights_addr` / `weight_offsets()` are the only ways to ask.
+**The first version of this was silently wrong**: `driver::Engine::open`'s resolver handed
+`decode::compile` the GGUF offset, so every tensor after the first Q6_K one (which the file puts
+first, at offset 0) was read at the wrong address. It did not fault and it did not print an error —
+the head read shifted bytes and the logits came out NaN. `crates/sn-hip/tests/phase7.rs` asserts
+the property instead: every tensor resolves inside the slab, in non-overlapping ascending order, and
+`output_norm.weight` — the file's second tensor — must *not* keep its offset.
+
+Cost: +131 MB (1.97 GB of Q6_K × 6.7 %), one host buffer the size of the largest Q6_K tensor at
+open time, no extra device copy. `sn gpu gemm` reports 47 → **51 checks, 0 failing**; the Q6_K GEMV
+is NMSE ≤ 3.5e-13 against `dq` on the padded bytes, and the GEMM path was updated to the same
+stride in the same change (its checks are what proved the stride change was complete).
+
+### 6.2 Measured: GEMV bandwidth, in the microbenchmark and in the graph
+
+```
+./Tools/build-kernels.sh && ./target/release/sn bench gemm --model <model>   # Q6_K rows
+  read bandwidth   282.0 GB/s over 268435456 B
+  output.weight        248320x4096 q6_k    217.9 GB/s   (was 101-114)
+  attn_qkv_gate        12288x4096  q6_k   215.7
+  ffn_down              4096x12288 q6_k   230.4          = 82 % of the read reference: the
+  attn_v                1024x4096  q6_k   200.7           Phase 5 `ffn_down >= 80 %` gate, met
+```
+
+The kernel is `sn_gemv_q6_k`, rewritten in the shape `sn_gemv_q4_k` already had: a wavefront covers
+four super-blocks per iteration, lane `l` takes the `uint4` `m = l & 7` of that super-block's `ql`
+(8 × 16 B = the whole 128-byte `ql`), and one `uint4` = 16 bytes = **32 values**, because byte `c`
+of a half-block holds the low nibble of element `c` and the high nibble of element `c + 64`. A
+16-element run has one scale (`sc[192 + 8hb + (m&3)]`, one `d*sc` multiply per 16 values) and one
+`qh` byte *per element* — the first version assumed one `qh` byte per run and scored NMSE 1.9
+against the oracle, which is the tell worth remembering: a wrong *bit* mapping looks like noise, a
+wrong byte mapping looks like a bigger number.
+
+In the graph (`sn run --bench 30 --ctx 8192`, differences against the whole program):
+
+| program | ms/token | t/s | GEMV time / bytes |
+|---|---|---|---|
+| Phase 7 as closed (§5.3, 986 ops) | 62.9 | 15.9 | 57.1 ms / ~8.8 GB = **149 GB/s** |
+| + Q6_K repack (989 launches) | 51.7 | 19.35 | 45.7 ms = 195 GB/s |
+| + `ffn_gate`+`ffn_up` as one launch (933 launches) | **50.7** | **19.71** | 44.7 ms / ~8.9 GB = **200 GB/s** |
+
+200 GB/s is 71 % of the 282 GB/s read reference and *inside* the 190-240 GB/s the per-shape
+microbenchmark reaches, so the "in-graph penalty" is now small and the remaining distance to 20 t/s
+is not a bandwidth mystery: 50.7 ms is 44.7 ms of GEMV, ~2.8 ms of recurrent inner kernels
+(`--drop recur` → 47.96 ms) and ~3 ms of everything else. What is left is bytes: 8.9 GB of weights
+per token divided by a machine that streams them at 200-280 GB/s.
+
+### 6.3 The `gemv ffn_gate + ffn_up` pair (the only multi-GEMV fusion that can be one kernel)
+
+`sn_gemv_q4_k_pair` takes two Q4_K matrices with the same `(k, n)` and one input, and maps global
+row `gr` to row `gr` of `W1` below `n` and `gr - n` of `W2` above it. `sn_q4k_row_dot` is now a
+`__device__` function shared by both entry points, so the 47 existing GEMV checks cover the pair
+too; `pair_checks` adds four more: both outputs vs `dq`, and **bit-identical to the two single
+launches** (same rows, same order, so any difference is the row mapping and not rounding).
+
+It is worth 56 launches per token and 0.95 ms, i.e. *not free but positive*: one launch drives
+24 576 rows instead of two driving 12 288 each, and the tail waves of a launch are the part that was
+not streaming weights. `driver::launchable_fusion()` is therefore `RAW` **with `multi_gemv` on**.
+
+The `q+k+v` triple stays a pending name, and the fusion flag is now split in two
+(`multi_gemv` = gate/up, `multi_qkv` = qkv) so the ladder cannot claim a fusion the kernels cannot
+make: `attn_v` is Q6_K in five of the nine full-attention blocks while `attn_q`/`attn_k` are Q4_K,
+so one entry point cannot serve all three. `tests/phase5.rs` pins the arithmetic (56 pair nodes,
+14 pending qkv nodes, the pair's grid is `gemv_grid(2n, wpr)`).
+
+### 6.4 The op count, honestly: 986 → 930, and why ≤ 300 is not reachable by fusion
+
+```
+./target/release/sn hip ops --model <model> --ladder
+raw (one kernel per step of §2):   971 launches ( 816 launchable today)
++ norm -> gemv:   859  ( 704)  -112        (measured *harmful*: +10.7 ms/token, §5.2)
++ silu -> gemv:   803  ( 648)  -56
++ multi-gemv pair (gate+up):   747 ( 592)  -56    <- built in §6.3
++ multi-gemv triple (qkv):     719 ( 550)  -28    <- pending: attn_v is Q6_K in 5 blocks
++ rope -> gemv:   691  ( 522)  -28                <- pending kernel
++ gate -> gemv:   677  ( 508)  -14                <- pending kernel
++ route+merge (= P2 target):   629 ( 364)  -48    <- pending kernel
+```
+
+The program the engine runs today: **930 ops / token** (`gemv 295, recur 154, norm 127, merge 100,
+silu 98, route 96, rope 28, add 16, gate 14, input 1, sample 1`). Turning on every remaining
+fusion reaches **629**, and 629 is not a number fusion can move much further: 267 weight
+multiplications, 154 recurrent inner kernels (one per KV region and one per GDN state per
+execution), and 146 route/merge/seed/expose kernels are one-per-thing by construction. §5's
+"the fused-pair kernels … alone can reach" the ≤ 300 target was **wrong**, and the correct statement
+is: reaching 300 needs fewer *weight matrices and cache regions per token*, i.e. a different model
+(MTP, Phase 9) or a different cache layout — not more fusion. At Phase 3's measured 2.9 µs per node
+inside a graph, 930 nodes is 2.7 ms of 50.7 ms; the op count is not what is keeping decode at
+19.7 t/s, the bytes are.
+
+### 6.5 `Engine::reset`, and the `n_seq = 2` gate the Phase 6 closure carried
+
+`Slab::clear_range` exists, and `Engine::reset(seq)` zeroes only that sequence's GDN state and conv
+regions and only that session (`Sessions::reset`). The version it replaced zeroed the whole cache
+slab *inside a loop over executions* — wasteful, and with `n_seq > 1` it was a wrong-answer bug:
+resetting one sequence erased the others'.
+
+The Phase 6 gate ("`n_seq = 2` with divergent prefixes gives the same result as two separate runs")
+is now run through real forwards, in `crates/sn-hip/tests/phase7.rs`: one engine with two sequences
+generates `p1-capital` and `p2-arithmetic`, the order is swapped after a `reset` of both, and the
+token streams are compared against a second single-sequence engine. Also asserted: `reset(0)` leaves
+`sessions().len(1)` alone, and the two prompts do not converge to one continuation (what a shared
+cache region would look like). **PASS** — the tokens are identical in all four runs, and the
+continuation is the same `11751 13 561 6511 314 …` the Phase 6 closure recorded.
+
+### 6.6 Phase 7b gate results
+
+| gate | target | measured | verdict |
+|---|---|---|---|
+| decode throughput at `n_ctx = 8192` | ≥ 20 t/s | **19.28 t/s** end-to-end (`-n 128`: 133 steps in 6.90 s), **19.71 t/s** graph-only `--bench 30` | **NOT MET** — from 15.6 at the start of Phase 7; the remaining 2 ms/token is weight bytes at 200 GB/s, not dispatch |
+| GEMV ≥ 80 % of measured bandwidth on `ffn_down` (the Phase 5 line, per quant class) | ≥ 80 % | Q6_K `ffn_down` 230.4 / 282.0 = **82 %**; Q4_K unchanged at 79-85 % | **MET** (it was 36-38 % for Q6_K) |
+| ops per decoded token | ≤ 300 | **930** (was 986); 629 with every remaining fusion | **NOT MET**, and now shown to be unreachable by fusion (§6.4) |
+| correctness through all of it | unchanged | `p1-capital` continuation unchanged; logits NMSE vs the Phase 2 reference **3.3e-12 / 3.2e-11 / 1.8e-11** at tokens 1/2/3 (was 3.2e-10 — the repack removed misaligned scalar loads) | **MET**, better |
+| `n_seq = 2` divergent prefixes | same as two separate runs | identical token streams, both orders, across a `reset` | **MET** (Phase 6 carry-over closed) |
+| kernel checks | 0 failing | `sn gpu gemm` **51 checks, 0 failing**; `sn gpu phase6` 63, 0 failing; `cargo test --workspace` green incl. the new `tests/phase7.rs`; clippy 0 | **MET** |
+| VRAM at `n_ctx = 32768`, q8_0 KV | ≤ 7.0 GB | **6.901 GiB** (7.41 GB decimal) in use, 1.083 GiB free — the repack's +131 MB is inside this | met as GiB, over as decimal GB (unchanged caveat) |
+| decode CPU | < 5 % | unchanged (no change to the loop) | MET, at the gate |
+
+**Not done after Phase 7b, named:** the four remaining fusion kernels (`gemv_multi_qkv`,
+RoPE-in-producer, gate-in-`wo`, SiLU-in-`ffn_down`, `sn_mhc_merge_route_f32`) — worth 174 more
+launches and ~3 ms, and no longer claimed to reach the op-count target; the `norm -> gemv` line of
+the ladder is kept for the record because it is a *measured negative*; and anything that would get
+decode over 20 t/s has to read fewer weight bytes per token, which is Phase 9's MTP, not Phase 7's.

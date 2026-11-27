@@ -26,7 +26,7 @@
 
 use std::ffi::c_void;
 
-use sn_core::dq::Mat;
+use sn_core::dq::{self, Mat};
 use sn_core::error::{Error, Result};
 use sn_core::gguf::Gguf;
 use sn_core::oracle;
@@ -294,6 +294,8 @@ impl std::fmt::Display for Path {
 pub struct Phase5 {
     pub gemv_q4_k: Kernel,
     pub gemv_q6_k: Kernel,
+    /// `ffn_gate` + `ffn_up` in one launch (Phase 7's `gemv_multi_gate_up`).
+    pub gemv_q4_k_pair: Kernel,
     pub gemv_f32: Kernel,
     pub gemm_q4_k: Kernel,
     pub gemm_q6_k: Kernel,
@@ -306,6 +308,7 @@ pub struct Phase5 {
 pub const PHASE5_SPECS: &[(&str, &str)] = &[
     ("gemv_q4_k", "sn_gemv_q4_k"),
     ("gemv_q6_k", "sn_gemv_q6_k"),
+    ("gemv_q4_k_pair", "sn_gemv_q4_k_pair"),
     ("gemv_f32", "sn_gemv_f32"),
     ("gemm_q4_k", "sn_gemm_q4_k"),
     ("gemm_q6_k", "sn_gemm_q6_k"),
@@ -350,6 +353,7 @@ impl Phase5 {
         Ok(Phase5 {
             gemv_q4_k: g("gemv_q4_k")?,
             gemv_q6_k: g("gemv_q6_k")?,
+            gemv_q4_k_pair: g("gemv_q4_k_pair")?,
             gemv_f32: g("gemv_f32")?,
             gemm_q4_k: g("gemm_q4_k")?,
             gemm_q6_k: g("gemm_q6_k")?,
@@ -547,6 +551,11 @@ pub struct WeightSlab {
     api: crate::hip::HipApi,
 }
 
+/// Every shape this bench touches, uploaded to one slab **in the device layout**: Q6_K tensors are
+/// stored with 224-byte super-blocks (`dq::q6k_pad` / `dq::device_size`), because that is the only
+/// layout the kernels in `phase5.hip` read. The oracle side stays on the GGUF's own bytes, so the
+/// check is "padded bytes through the vector kernel vs wire bytes through `dq::Mat`", which is
+/// exactly the property the repack has to keep.
 pub fn upload_shapes(g: &Gguf, dev: &crate::hip::Device, shapes: &[Shape], scratch_bytes: usize) -> Result<WeightSlab> {
     let mut offsets = Vec::new();
     let mut total = 0usize;
@@ -554,12 +563,19 @@ pub fn upload_shapes(g: &Gguf, dev: &crate::hip::Device, shapes: &[Shape], scrat
         let t = g.tensor(&s.tensor)?;
         total = total.div_ceil(256) * 256;
         offsets.push(total);
-        total += t.size as usize;
+        total += dq::device_size(t);
     }
     let slab = Slab::new(&dev.api, total.max(256), "phase5 weights")?;
     for (i, s) in shapes.iter().enumerate() {
         let t = g.tensor(&s.tensor)?;
-        slab.write(&dev.api, offsets[i], g.tensor_data(t))?;
+        let data = g.tensor_data(t);
+        if t.ty == qtypes::ty::Q6_K {
+            let mut pad = vec![0u8; dq::device_size(t)];
+            dq::q6k_pad(data, &mut pad)?;
+            slab.write(&dev.api, offsets[i], &pad)?;
+        } else {
+            slab.write(&dev.api, offsets[i], data)?;
+        }
     }
     let scratch = Slab::new(&dev.api, scratch_bytes.max(1 << 20), "phase5 scratch")?;
     scratch.zero(&dev.api)?;
@@ -847,6 +863,90 @@ pub fn f32_checks(p5: &Phase5, ws: &mut WeightSlab, dev: &crate::hip::Device, st
             dot(&flat[c * k..(c + 1) * k], &mut wantg[c * n..(c + 1) * n]);
         }
         out.push(score_g(&format!("gemm synthetic f32 x T={t}"), &gotg, &wantg, 1e-4));
+    }
+    Ok(out)
+}
+
+/// The Phase 7 pair GEMV (`ffn_gate` + `ffn_up`, one launch) against two separate GEMVs of the
+/// same two tensors through `sn-core::dq`. Both matrices are Q4_K with identical `(k, n)` in every
+/// block of this checkpoint - that is what makes one entry point legal - so the check takes the
+/// first such pair the shape table offers and stops: the kernel has no shape-dependent code beyond
+/// the `gr < n` row mapping, and that mapping is exactly what is being tested.
+pub fn pair_checks(p5: &Phase5, g: &Gguf, ws: &mut WeightSlab, shapes: &[Shape], plan: &Plan, dev: &crate::hip::Device, stream: *mut c_void) -> Result<Vec<Check>> {
+    ws.rewind();
+    let mut out = Vec::new();
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let mut done = false;
+    for a in shapes {
+        if done {
+            break;
+        }
+        if a.role != "blk.N.ffn_gate.weight" || a.type_name != "q4_k" {
+            continue;
+        }
+        let b = match shapes.iter().find(|s| s.role == "blk.N.ffn_up.weight" && s.type_name == "q4_k" && s.k == a.k && s.n == a.n) {
+            Some(b) => b,
+            None => continue,
+        };
+        let (ia, ib) = (shapes.iter().position(|s| std::ptr::eq(s, a)).unwrap(), shapes.iter().position(|s| std::ptr::eq(s, b)).unwrap());
+        eprintln!("  checking {} + {} as one launch ...", a.role, b.role);
+        let x = activation(1700 + a.n as u64, a.k);
+        let xoff = ws.alloc(a.k * 4)?;
+        let ya = ws.alloc(a.n * 4)?;
+        let yb = ws.alloc(b.n * 4)?;
+        ws.put_f32(xoff, &x)?;
+        let wpr = pick_warps(a.n, a.k, PICK_CUS);
+        let mut bld = ProgramBuilder::new(dev);
+        bld.kernel(
+            "gemv q4_k pair ffn_gate+ffn_up",
+            &p5.gemv_q4_k_pair,
+            gemv_grid(2 * a.n, wpr),
+            0,
+            &[
+                Arg::Ptr(ws.slab.addr() + ws.offsets[ia] as u64),
+                Arg::Ptr(ws.slab.addr() + ws.offsets[ib] as u64),
+                Arg::Ptr(ws.saddr(xoff)),
+                Arg::Ptr(ws.saddr(ya)),
+                Arg::Ptr(ws.saddr(yb)),
+                Arg::I32(a.k as i32),
+                Arg::I32(a.n as i32),
+                Arg::U64(0),
+                Arg::F32(plan.hp.rms_eps),
+                Arg::I32(wpr as i32),
+            ],
+        )?;
+        let p = bld.finish();
+        p.launch(dev, stream)?;
+        crate::hip::check("pair check sync", dev.api.hipStreamSynchronize.unwrap()(stream), &dev.api)?;
+        let got_a = ws.get_f32(ya, a.n)?;
+        let got_b = ws.get_f32(yb, b.n)?;
+        for (s, got) in [(&shapes[ia], &got_a), (&shapes[ib], &got_b)] {
+            let m = Mat::by_name(g, &s.tensor)?;
+            let mut want = vec![0f32; s.n];
+            m.gemv_par(&x, &mut want, threads);
+            out.push(score_g(&format!("gemv pair {} {}", s.role, s.key()), got, &want, 1e-4));
+        }
+        // And the pair must agree with the two single launches bit-for-bit: same kernel body, same
+        // accumulation order per row, so any difference is the row mapping, not rounding.
+        let pa = gemv_program(&p5.gemv_q4_k, ws.slab.addr() + ws.offsets[ia] as u64, ws.saddr(xoff), ws.saddr(ya), &shapes[ia], 0, plan.hp.rms_eps, wpr, dev)?;
+        let pb = gemv_program(&p5.gemv_q4_k, ws.slab.addr() + ws.offsets[ib] as u64, ws.saddr(xoff), ws.saddr(yb), &shapes[ib], 0, plan.hp.rms_eps, wpr, dev)?;
+        pa.launch(dev, stream)?;
+        pb.launch(dev, stream)?;
+        crate::hip::check("pair control sync", dev.api.hipStreamSynchronize.unwrap()(stream), &dev.api)?;
+        let solo_a = ws.get_f32(ya, a.n)?;
+        let solo_b = ws.get_f32(yb, b.n)?;
+        for (label, one, other) in [("gate", &got_a, &solo_a), ("up", &got_b, &solo_b)] {
+            let same = one == other;
+            out.push(Check {
+                name: format!("gemv pair {label} bit-identical to the single launch"),
+                against: "single-tensor GEMV",
+                n: one.len(),
+                nmse: if same { 0.0 } else { 1.0 },
+                max_abs: if same { 0.0 } else { oracle::max_abs(one, other) },
+                gate: 0.0,
+            });
+        }
+        done = true;
     }
     Ok(out)
 }

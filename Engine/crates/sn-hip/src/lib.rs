@@ -114,6 +114,28 @@ impl Slab {
         check("hipMemset", api.hipMemset.unwrap()(self.ptr, 0, self.len), api)
     }
 
+    /// Zero `[offset, offset + len)` of the slab. The Phase 7 refinement `driver::Engine::reset`
+    /// asked for: clearing one sequence's GDN regions must not touch the other sequences' bytes, and
+    /// with `n_seq` sequences and 42 state regions a whole-slab `hipMemset` per reset is 88 MB per
+    /// sequence per reset. Ranges are taken from `CacheLayout`, so they are the same offsets the
+    /// compiled program bakes - there is no second map of the cache to keep in sync.
+    pub fn clear_range(&self, api: &HipApi, offset: usize, len: usize) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        if offset + len > self.len {
+            return Err(Error::msg(format!(
+                "{}: clearing {len} bytes at {offset} overruns a {} byte slab",
+                self.what, self.len
+            )));
+        }
+        check(
+            &format!("hipMemset({} {offset}..{})", self.what, offset + len),
+            api.hipMemset.unwrap()(unsafe { (self.ptr as *mut u8).add(offset) } as *mut c_void, 0, len),
+            api,
+        )
+    }
+
     /// Device-to-host. The Phase 6 forward needs it (read the logits, read the sampled token);
     /// until now every read-back lived privately inside the check harness.
     pub fn read(&self, api: &HipApi, offset: usize, len: usize) -> Result<Vec<u8>> {
@@ -212,6 +234,11 @@ pub struct Substrate {
     io: Option<Pinned>,
     /// Where the GGUF tensor data section starts in the file; weights addresses are relative to it.
     data_start: u64,
+    /// GGUF `offset` -> offset in the weight slab, for the tensors the repack moved. Empty when the
+    /// slab is the data section verbatim (`upload_weights_raw`), which is the only case where an
+    /// unmapped offset is the right answer.
+    weight_map: std::collections::HashMap<u64, u64>,
+    weights_padded: bool,
 }
 
 impl Substrate {
@@ -243,12 +270,88 @@ impl Substrate {
             caches: None,
             io: None,
             data_start: 0,
+            weight_map: std::collections::HashMap::new(),
+            weights_padded: false,
         })
     }
 
-    /// Upload the model: one allocation, one copy, exactly the file's data section. Every tensor
-    /// address is then `weights_addr(t.offset)` (design-plan P1: "one `hipMalloc` for weights").
+    /// Upload the model: one allocation, and a copy per tensor into the **device layout** - the
+    /// data section with every Q6_K tensor's super-blocks padded from 210 to 224 bytes
+    /// (`sn-core::dq::Q6K_BLOCK_PADDED`, and one `q6k_pad`'s worth of reasoning behind it).
+    ///
+    /// That is the Phase 5 finding the plan deferred to a "staging decision": at 210 bytes no
+    /// vector load inside a Q6_K row is aligned, which held 1.97 GB of this checkpoint - including
+    /// the 834 MB output head every decoded token reads - at 102-108 GB/s against Q4_K's 222-239
+    /// (`Docs/bench.md` §3.2, §5.4). Padding costs 6.7 % of those bytes (+131 MB here) and breaks
+    /// the "device address = base + GGUF offset" contract for everything after the first Q6_K
+    /// tensor, so the mapping is kept here and `weights_addr` is the only way to ask.
+    ///
+    /// The alternative that was *not* taken: repacking on the device after a verbatim copy. It needs
+    /// a second 2 GB pass over the slab at open time and a second resident copy; staging during the
+    /// upload costs one host buffer the size of the largest Q6_K tensor and no extra device bytes.
     pub fn upload_weights(&mut self, g: &Gguf) -> Result<usize> {
+        let align = g.alignment.max(32);
+        let data = g.data_section();
+        // Pass 1: the device layout. Same order as the file, same alignment rule, Q6_K rows grown.
+        let mut plan: Vec<(u64, u64, usize)> = Vec::new(); // (gguf offset, device offset, size)
+        let mut cur = 0u64;
+        let mut prev = 0u64;
+        for t in g.tensors() {
+            if t.offset < prev {
+                return Err(Error::msg(format!(
+                    "upload_weights: tensor {} has GGUF offset {}, before {} - the repack assumes the header lists tensors in ascending offset order",
+                    t.name, t.offset, prev
+                )));
+            }
+            prev = t.offset;
+            let size = sn_core::dq::device_size(t);
+            cur = cur.div_ceil(align) * align;
+            plan.push((t.offset, cur, size));
+            cur += size as u64;
+        }
+        let total = cur as usize;
+        let slab = Slab::alloc(&self.dev.api, total.max(256), "weights")?;
+        let base = slab.ptr() as *mut u8;
+        let mut map = std::collections::HashMap::new();
+        let api = &self.dev.api;
+        // `g.tensors()` is in ascending-offset order and `plan` was built from it, so the two
+        // iterators stay in step.
+        for (t, (goff, doff, size)) in g.tensors().iter().zip(plan.iter()) {
+            let src = &data[*goff as usize..*goff as usize + t.size as usize];
+            let dst = unsafe { base.add(*doff as usize) } as *mut c_void;
+            if t.ty == sn_core::qtypes::ty::Q6_K {
+                let mut pad = vec![0u8; *size];
+                sn_core::dq::q6k_pad(src, &mut pad)?;
+                check(
+                    "hipMemcpy(weights q6_k padded)",
+                    api.hipMemcpy.unwrap()(dst, pad.as_ptr() as *const c_void, *size, hip::MEMCPY_HOST_TO_DEVICE),
+                    api,
+                )?;
+            } else {
+                check(
+                    "hipMemcpy(weights)",
+                    api.hipMemcpy.unwrap()(dst, src.as_ptr() as *const c_void, *size, hip::MEMCPY_HOST_TO_DEVICE),
+                    api,
+                )?;
+            }
+            if doff != goff {
+                // One entry per moved tensor: 490 lookups at open time, none in a decode loop.
+                map.insert(*goff, *doff);
+            }
+        }
+        self.data_start = g.data_start;
+        let len = slab.len();
+        self.weights = Some(slab);
+        self.weight_map = map;
+        self.weights_padded = true;
+        Ok(len)
+    }
+
+    /// The Phase 3 contract: the data section verbatim, one allocation, one copy, every address
+    /// `base + gguf offset`. Kept because the graph-replay gate and the Phase 3 test need a weight
+    /// slab without a repack, and because it is the control that says whether the repack changed
+    /// anything it should not have.
+    pub fn upload_weights_raw(&mut self, g: &Gguf) -> Result<usize> {
         let data = g.data_section();
         let slab = Slab::alloc(&self.dev.api, data.len(), "weights")?;
         check(
@@ -264,13 +367,28 @@ impl Substrate {
         self.data_start = g.data_start;
         let len = slab.len();
         self.weights = Some(slab);
+        self.weight_map.clear();
+        self.weights_padded = false;
         Ok(len)
     }
 
-    /// The device address of a tensor given its GGUF `offset` field.
+    /// True when the weight slab stores Q6_K super-blocks padded (the engine's layout).
+    pub fn weights_padded(&self) -> bool {
+        self.weights_padded
+    }
+
+    /// The repack map: GGUF `offset` -> offset inside the weight slab. Tensors the repack did not
+    /// move are absent, meaning identity. The decode compiler needs this (it bakes tensor addresses
+    /// into the program), so it is public rather than private to `weights_addr`.
+    pub fn weight_offsets(&self) -> &std::collections::HashMap<u64, u64> {
+        &self.weight_map
+    }
+
+    /// The device address of a tensor given its GGUF `offset` field, through the repack map.
     pub fn weights_addr(&self, offset: u64) -> Result<u64> {
         let w = self.weights()?;
-        w.at(offset as usize)
+        let off = *self.weight_map.get(&offset).unwrap_or(&offset);
+        w.at(off as usize)
     }
 
     pub fn weights(&self) -> Result<&Slab> {

@@ -38,7 +38,17 @@
 //   block_q6_K = { ql:u8[128] @0, qh:u8[64] @128, sc:i8[16] @192, d:f16 @208 } = 210 B / 256 values
 #define SN_QK_K 256
 #define SN_Q4K_BLOCK 144
+// The wire size of a Q6_K super-block, kept for documentation. Nothing addresses with it: every
+// Q6_K tensor this engine reads on the device has been repacked to a 224-byte super-block stride
+// (`SN_Q6K_STRIDE`) by the uploader, see the note above `sn_gemv_q6_k`.
 #define SN_Q6K_BLOCK 210
+// The **device** stride of a Q6_K super-block: 224 = 16 * 14, so with a 16-byte-aligned slab every
+// super-block is 16-byte aligned and its fields sit at their wire offsets (`ql` 0, `qh` 128, `sc`
+// 192, `d` 208). The wire stride is 210 and 210 % 16 == 2, which makes *no* vector load inside a
+// row aligned - unaligned vector loads on GCN are undefined, not checked. This is a staging
+// decision, and `Substrate::upload_weights` / `gemm::upload_shapes` are the two places that make
+// the device layout real; `sn-core::dq::q6k_pad` is the one place that knows how.
+#define SN_Q6K_STRIDE 224
 
 // ---------------------------------------------------------------------------------------------
 // helpers
@@ -186,23 +196,22 @@ __device__ __forceinline__ void sn_q4k_sc_min(const unsigned char* s, int j, flo
 ///
 /// Determinism is unchanged: the accumulation order inside a lane is fixed, and the cross-lane
 /// reduce is the fixed two-stage butterfly in `sn_row_group_sum` (no atomics).
-extern "C" __global__ void sn_gemv_q4_k(const unsigned char* __restrict__ W, const float* __restrict__ x,
-                                        float* __restrict__ y, int k, int n, const float* __restrict__ norm_w,
-                                        float eps, int warps_per_row) {
-    __shared__ float red[SN_GEMV_BLOCK];
-    const int threads_per_row = 32 * warps_per_row;
-    const int rows_per_wg = SN_GEMV_BLOCK / threads_per_row;
-    const int row = (int)blockIdx.x * rows_per_wg + (int)threadIdx.x / threads_per_row;
-    if (row >= n) return;
-
-    const int in_row = (int)threadIdx.x % threads_per_row;
+/// One Q4_K row's dot product, fully reduced. Split out of `sn_gemv_q4_k` so that
+/// `sn_gemv_q4_k_pair` (Phase 7's `gemv ffn_gate + ffn_up` batch: two matrices that share one
+/// input, one launch instead of two) is a row-index mapping and nothing else - the dequantise/dot
+/// code exists once, and the 47 existing checks therefore cover both entry points.
+/// `wr` is the base of the row, `in_row` the caller's index inside its row group, `red` the
+/// workgroup's reduce scratch. Every thread of a row group must call it: the norm scale and the
+/// row reduce both use `__syncthreads`.
+__device__ __forceinline__ float sn_q4k_row_dot(const unsigned char* __restrict__ wr, const float* __restrict__ x,
+                                                int k, const float* __restrict__ norm_w, float eps, int warps_per_row,
+                                                int in_row, float* red) {
     const int lane = in_row & 31;
     const int wpr_idx = in_row >> 5;
 
     const float scale = norm_w ? sn_norm_scale(x, k, eps) : 1.0f;
 
     const int nb = k / SN_QK_K;
-    const unsigned char* wr = W + (size_t)row * (size_t)(nb * SN_Q4K_BLOCK);
 
     const int p = (lane >> 1) & 3;   // sub-block pair inside this super-block
     const int h = lane & 1;          // which 16 bytes of the pair's 32
@@ -263,23 +272,78 @@ extern "C" __global__ void sn_gemv_q4_k(const unsigned char* __restrict__ W, con
         acc += ds1 * a1 - dm1 * s1;
     }
 
-    acc = sn_row_group_sum(acc, red, warps_per_row);
-    if (wpr_idx == 0 && (threadIdx.x & 31) == 0) y[row] = acc;
+    return sn_row_group_sum(acc, red, warps_per_row);
 }
 
-/// Q6_K. `q6k_value`/`q6k_dequant` in `dq.rs`, one value per (lane, group): lane `l` of a
-/// wavefront owns element `32g + l` of each half-block, which is the walk the reference does.
+extern "C" __global__ void sn_gemv_q4_k(const unsigned char* __restrict__ W, const float* __restrict__ x,
+                                        float* __restrict__ y, int k, int n, const float* __restrict__ norm_w,
+                                        float eps, int warps_per_row) {
+    __shared__ float red[SN_GEMV_BLOCK];
+    const int threads_per_row = 32 * warps_per_row;
+    const int rows_per_wg = SN_GEMV_BLOCK / threads_per_row;
+    const int row = (int)blockIdx.x * rows_per_wg + (int)threadIdx.x / threads_per_row;
+    if (row >= n) return;
+    const int in_row = (int)threadIdx.x % threads_per_row;
+    const float v = sn_q4k_row_dot(
+        W + (size_t)row * (size_t)((k / SN_QK_K) * SN_Q4K_BLOCK), x, k, norm_w, eps, warps_per_row, in_row, red);
+    if ((in_row >> 5) == 0 && ((threadIdx.x & 31) == 0)) y[row] = v;
+}
+
+/// Two Q4_K matrices with the same `(k, n)` and the same input, in **one** launch: global row
+/// `gr` is row `gr` of `W1` for `gr < n` and row `gr - n` of `W2` above that. That is the
+/// `gemv_multi_gate_up` fusion the §6 P2 list names - `ffn_gate` and `ffn_up` are read from the
+/// same normalised vector by every one of the 48 FFNs, so it removes 33 launches per token and
+/// doubles the row stream each launch drives (12288 rows to 24576, which is where the small
+/// tail-wave win comes from). Both matrices are Q4_K for every block in this checkpoint
+/// (`Tools/tensor_census.py`), which is what makes one entry point enough; the `q+k+v` pair is
+/// not, because `attn_v` is Q6_K in five blocks, so that one stays a pending name.
+extern "C" __global__ void sn_gemv_q4_k_pair(const unsigned char* __restrict__ W1, const unsigned char* __restrict__ W2,
+                                             const float* __restrict__ x, float* __restrict__ y1, float* __restrict__ y2,
+                                             int k, int n, const float* __restrict__ norm_w, float eps,
+                                             int warps_per_row) {
+    __shared__ float red[SN_GEMV_BLOCK];
+    const int threads_per_row = 32 * warps_per_row;
+    const int rows_per_wg = SN_GEMV_BLOCK / threads_per_row;
+    const int gr = (int)blockIdx.x * rows_per_wg + (int)threadIdx.x / threads_per_row;
+    if (gr >= 2 * n) return;
+    const bool first = gr < n;
+    const int row = first ? gr : gr - n;
+    const unsigned char* W = first ? W1 : W2;
+    const int in_row = (int)threadIdx.x % threads_per_row;
+    const float v = sn_q4k_row_dot(
+        W + (size_t)row * (size_t)((k / SN_QK_K) * SN_Q4K_BLOCK), x, k, norm_w, eps, warps_per_row, in_row, red);
+    if ((in_row >> 5) == 0 && ((threadIdx.x & 31) == 0)) {
+        if (first) { y1[row] = v; } else { y2[row] = v; }
+    }
+}
+
+/// Q6_K, wide-load form (Phase 7). The Phase 5 version walked the format the way `dq.rs` does -
+/// one byte per value - and measured 102-108 GB/s, 36 % of the device's read bandwidth, against
+/// Q4_K's 222-239 (`Docs/bench.md` §3.2). The reason was not the arithmetic: at 210 bytes per
+/// super-block no load in a row is vector-aligned, so it *could not* issue the loads Q4_K issues.
+/// With the super-block stride repacked to 224 bytes (`SN_Q6K_STRIDE`) the same shape of kernel as
+/// `sn_gemv_q4_k` becomes legal, and that is what this is: a wavefront covers **four super-blocks
+/// per iteration**, lane `l` takes the `uint4` `m = l & 7` of that super-block's `ql` (8 x 16 B =
+/// the whole 128-byte `ql`), and one `uint4` = 16 bytes = 32 values, because byte `c` of a
+/// half-block holds the low nibble of element `c` and the high nibble of element `c + 64`.
 ///
-/// Unlike Q4_K this kernel cannot use wide loads, and that is worth recording precisely because it
-/// is the reason Q6_K sits at ~104 GB/s where Q4_K reaches 231 (`Docs/bench.md` §3.2): a Q6_K
-/// super-block is **210 bytes**, so consecutive rows of a matrix start at offsets that are only
-/// 2-byte aligned (210 mod 16 = 2) and no `uint4`/`uint` load inside one is aligned. The first
-/// version of this kernel tried the `uint4` trick anyway and produced garbage (NMSE 4e16) rather
-/// than faulting - unaligned vector loads on GCN are undefined, not checked. The fix is a staging
-/// decision, not a kernel one: lay Q6_K super-blocks out padded to 224 bytes in the weight arena
-/// (Phase 6), which makes every field aligned at its existing offset and costs 6.7 % of the Q6_K
-/// bytes at load time. Until then this path is byte loads, and the loads - not the DRAM - set the
-/// rate.
+/// The per-lane index arithmetic below is that layout, derived from `dq::q6k_dequant` and asserted
+/// against it by `sn gpu gemm` (the same oracle, the same bytes, only re-spaced by `dq::q6k_pad`):
+///   half (128 values)  hb = m >> 2, and the `uint4` covers bytes 16*(m&3) .. +15 of that half
+///   element indices    lo = 256b + 128hb + 16(m&3) + j,  hi = lo + 64,  j = 0..15
+///   one top-bits BYTE per element  qh[128 + 32hb + l] with l = element % 32, so a 16-element run
+///                      reads 16 consecutive `qh` bytes - one `uint4` - and the two bits for the
+///                      low nibbles sit at shift `2g`, for the high ones at `2g + 4`, with
+///                      g = (m&3)>>1 (low) and 2 + (m&3)>>1 (high). (The first version of this
+///                      kernel assumed one byte per run and scored NMSE 1.9 against the oracle.)
+///   two scales         sc[192 + 8hb + (m&3)] (low) and sc[192 + 8hb + 4 + (m&3)] (high) - one
+///                      scale per 16 elements, which is why a 16-element run has a constant scale
+/// That last fact is what makes the inner loop cheap: over a run the value is
+/// `16*hi_j + nib_j - 32` with `hi_j` two bits of that element's `qh` byte, so
+/// `sum(value * x) = 16*sum(hi*x) + sum(nib*x) - 32*sum(x)` - three vector sums of loaded data,
+/// no per-element dequantise-and-multiply, and one `d * sc` multiply covers 16 values.
+///
+/// Determinism: fixed per-lane order, fixed two-stage reduce, no atomics.
 extern "C" __global__ void sn_gemv_q6_k(const unsigned char* __restrict__ W, const float* __restrict__ x,
                                         float* __restrict__ y, int k, int n, const float* __restrict__ norm_w,
                                         float eps, int warps_per_row) {
@@ -296,27 +360,66 @@ extern "C" __global__ void sn_gemv_q6_k(const unsigned char* __restrict__ W, con
     const float scale = norm_w ? sn_norm_scale(x, k, eps) : 1.0f;
 
     const int nb = k / SN_QK_K;
-    const unsigned char* wr = W + (size_t)row * (size_t)(nb * SN_Q6K_BLOCK);
-    const int is = lane >> 4;   // the `is` in dq's `sc[is + 2k]`
+    const unsigned char* wr = W + (size_t)row * (size_t)(nb * SN_Q6K_STRIDE);
+
+    const int sb = lane >> 3;              // which of the four super-blocks this wavefront covers
+    const int m = lane & 7;               // which uint4 of ql (8 * 16 B = 128 B)
+    // Loop-invariant per lane.
+    const int hb = m >> 2;                // the 128-value half this uint4 belongs to
+    const int qh_off = 128 + 32 * hb + 16 * (m & 1); // 16 qh bytes, one per element of the run
+    const int sc_idx = 192 + 8 * hb + (m & 3);
+    const int sh = 2 * ((m & 3) >> 1);    // low-nibble bit shift; +4 for the high nibbles
+    const int e_off = 128 * hb + 16 * (m & 3);
 
     float acc = 0.0f;
-    for (int b = wpr_idx; b < nb; b += warps_per_row) {
-        const unsigned char* blk = wr + (size_t)b * SN_Q6K_BLOCK;
+    for (int b0 = wpr_idx * 4; b0 < nb; b0 += warps_per_row * 4) {
+        const int b = b0 + sb;
+        if (b >= nb) continue;
+        const unsigned char* blk = wr + (size_t)b * SN_Q6K_STRIDE;
         const float d = sn_ld_f16(blk + 208);
+        const SnU4 q = reinterpret_cast<const SnU4*>(blk)[m];
+        const SnU4 qh = reinterpret_cast<const SnU4*>(blk + qh_off)[0];
+        const float sc_lo = (float)((signed char)blk[sc_idx]);
+        const float sc_hi = (float)((signed char)blk[sc_idx + 4]);
+
+        const int e0 = b * SN_QK_K + e_off;      // low nibbles: 16 consecutive elements
+        const int e1 = e0 + 64;                  // high nibbles: the next 16
+        float sx_lo = 0.0f, sn_lo = 0.0f, sh_lo = 0.0f;
+        float sx_hi = 0.0f, sn_hi = 0.0f, sh_hi = 0.0f;
 #pragma unroll
-        for (int hb = 0; hb < 2; hb++) {
-            // The top-two-bits byte is the same for all four groups of this half-block: one load.
-            const unsigned int qh = blk[128 + 32 * hb + lane];
+        for (int i = 0; i < 4; i++) {
+            // e0/e1 are multiples of 16, so these are aligned float4 loads (the arena hands out
+            // 256-byte-aligned slots).
+            const SnF4 xa = reinterpret_cast<const SnF4*>(x + e0)[i];
+            const SnF4 xb = reinterpret_cast<const SnF4*>(x + e1)[i];
+            float wa[4], wb[4];
+            if (norm_w) {
+                const SnF4 na = reinterpret_cast<const SnF4*>(norm_w + e0)[i];
+                const SnF4 nb2 = reinterpret_cast<const SnF4*>(norm_w + e1)[i];
+                wa[0] = xa.x * scale * na.x; wa[1] = xa.y * scale * na.y;
+                wa[2] = xa.z * scale * na.z; wa[3] = xa.w * scale * na.w;
+                wb[0] = xb.x * scale * nb2.x; wb[1] = xb.y * scale * nb2.y;
+                wb[2] = xb.z * scale * nb2.z; wb[3] = xb.w * scale * nb2.w;
+            } else {
+                wa[0] = xa.x * scale; wa[1] = xa.y * scale; wa[2] = xa.z * scale; wa[3] = xa.w * scale;
+                wb[0] = xb.x * scale; wb[1] = xb.y * scale; wb[2] = xb.z * scale; wb[3] = xb.w * scale;
+            }
+            const unsigned int qw = q[i];   // bytes 4i..4i+3, i.e. elements j = 4i..4i+3
+            const unsigned int qb = qh[i];  // the same elements' top-two-bits bytes
+            sx_lo += wa[0] + wa[1] + wa[2] + wa[3];
+            sx_hi += wb[0] + wb[1] + wb[2] + wb[3];
 #pragma unroll
-            for (int g = 0; g < 4; g++) {
-                const unsigned char qlb = blk[64 * hb + ((g & 1) ? 32 + lane : lane)];
-                const unsigned int nib = (g < 2) ? (qlb & 0xFu) : (qlb >> 4);
-                const unsigned int bits = (qh >> (2 * g)) & 0x3u;
-                const signed char sc = (signed char)blk[192 + 8 * hb + is + 2 * g];
-                const int idx = b * SN_QK_K + 128 * hb + 32 * g + lane;
-                acc += d * (float)sc * (float)((int)((bits << 4) | nib) - 32) * sn_xv(x, idx, scale, norm_w);
+            for (int t = 0; t < 4; t++) {
+                const unsigned int s = 8u * (unsigned)t;
+                sn_lo += (float)((qw >> s) & 0xFu) * wa[t];
+                sh_lo += (float)((qb >> (s + (unsigned)sh)) & 0x3u) * wa[t];
+                sn_hi += (float)((qw >> (s + 4u)) & 0xFu) * wb[t];
+                sh_hi += (float)((qb >> (s + 4u + (unsigned)sh)) & 0x3u) * wb[t];
             }
         }
+        // value = (hi << 4) | nib, signed-biased by 32.
+        acc += d * sc_lo * (16.0f * sh_lo + sn_lo - 32.0f * sx_lo);
+        acc += d * sc_hi * (16.0f * sh_hi + sn_hi - 32.0f * sx_hi);
     }
 
     acc = sn_row_group_sum(acc, red, warps_per_row);
@@ -416,7 +519,7 @@ __device__ __forceinline__ float sn_w1_q4k(const unsigned char* W, int row, int 
 
 __device__ __forceinline__ float sn_w1_q6k(const unsigned char* W, int row, int k, int kk) {
     const int nb = k / SN_QK_K;
-    const unsigned char* blk = W + (size_t)row * (size_t)(nb * SN_Q6K_BLOCK) + (size_t)(kk / SN_QK_K) * SN_Q6K_BLOCK;
+    const unsigned char* blk = W + (size_t)row * (size_t)(nb * SN_Q6K_STRIDE) + (size_t)(kk / SN_QK_K) * SN_Q6K_STRIDE;
     const int hb = (kk % SN_QK_K) / 128;
     const int l = kk % 32;
     const int g = (kk % 128) / 32;

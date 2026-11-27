@@ -403,6 +403,7 @@ pub fn cmd_gemm(opt_val: &impl Fn(&str) -> Option<String>, bench: bool) -> Resul
     // The f32 kernels are gated too, against a synthetic matrix: this checkpoint has no f32 2-D
     // weights, and an untested kernel is a worse answer than a synthetic test.
     checks.extend(sn_hip::gemm::f32_checks(&p5, &mut ws, &sub.dev, sub.stream, &plan)?);
+    checks.extend(sn_hip::gemm::pair_checks(&p5, &g, &mut ws, &shapes, &plan, &sub.dev, sub.stream)?);
     out += "\ncorrectness against sn_core::dq (the reference Phase 2 matched GGML's C with), same bytes\n";
     out += &check::report(&checks);
     let fails = checks.iter().filter(|c| !c.ok()).count();
@@ -489,13 +490,14 @@ pub fn cmd_ops(
     let ladder = flag("--ladder");
     if ladder {
         // The fusion ladder: each row turns one more §6 P2 fusion on, so the count is attributable.
-        let presets: [(&str, Fusion); 7] = [
+        let presets: [(&str, Fusion); 8] = [
             ("raw (one kernel per step of §2)", Fusion::RAW),
             ("+ norm -> gemv", Fusion { norm_into_gemv: true, ..Fusion::RAW }),
             ("+ silu -> gemv", Fusion { norm_into_gemv: true, silu_into_gemv: true, ..Fusion::RAW }),
-            ("+ multi-gemv", Fusion { norm_into_gemv: true, silu_into_gemv: true, multi_gemv: true, ..Fusion::RAW }),
-            ("+ rope -> gemv", Fusion { norm_into_gemv: true, silu_into_gemv: true, multi_gemv: true, rope_into_gemv: true, ..Fusion::RAW }),
-            ("+ gate -> gemv", Fusion { norm_into_gemv: true, silu_into_gemv: true, multi_gemv: true, rope_into_gemv: true, gate_into_gemv: true, ..Fusion::RAW }),
+            ("+ multi-gemv pair (gate+up)", Fusion { norm_into_gemv: true, silu_into_gemv: true, multi_gemv: true, ..Fusion::RAW }),
+            ("+ multi-gemv triple (qkv)", Fusion { norm_into_gemv: true, silu_into_gemv: true, multi_gemv: true, multi_qkv: true, ..Fusion::RAW }),
+            ("+ rope -> gemv", Fusion { norm_into_gemv: true, silu_into_gemv: true, multi_gemv: true, multi_qkv: true, rope_into_gemv: true, ..Fusion::RAW }),
+            ("+ gate -> gemv", Fusion { norm_into_gemv: true, silu_into_gemv: true, multi_gemv: true, multi_qkv: true, rope_into_gemv: true, gate_into_gemv: true, ..Fusion::RAW }),
             ("+ route+merge (= P2 target)", Fusion::FUSED),
         ];
         let mut prev: Option<usize> = None;
