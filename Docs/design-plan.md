@@ -211,6 +211,17 @@ Streams `a, b ∈ R^[4096, T]`, seeded once at the first mHC execution (`il == 4
 then carried across **all 48** looped executions. At the end of each mHC execution the exposed value is
 `cur = 0.5·(a + b)`; the next execution ignores `cur` and re‑derives everything from `a, b`.
 
+> **What that means for an engine (2026‑11‑27).** Exactly two ops follow from this sentence, and where
+> they sit is load‑bearing: a *seed* (`a = b = cur`) before the first mHC execution — nothing else ever
+> writes the streams, so without it the first route reads memory the previous token left there, which is
+> silently plausible — and one *expose* at the **mHC → non‑mHC boundary**, because every mHC execution
+> except the last is followed by another one that ignores `cur`. For this checkpoint that boundary is after
+> execution 51, before the exit blocks (physical 28..31, `blk.52..55`); exposing in the head instead makes
+> the exit blocks read a `cur` last written at execution 3 *and* scores the loop's streams instead of block
+> 55's output. Both are plan‑derived (first/last execution with `mhc` true), never taken from
+> `mhc.start`/`mhc.end`. Kernels: `sn_mhc_seed_f32` / `sn_mhc_expose_f32`; oracles: `oracle::mhc_seed` /
+> `oracle::mhc_expose`.
+
 `route(a, b, W[8192,8], bias[8])` — note **one** unweighted RMS over the *concatenated* 8192 vector, ε = **1e‑6 hard‑coded**:
 ```
 f   = rms([a ; b], 1e-6)                    # eps 1e-6, NOT hparams rms eps (same value here)
@@ -412,7 +423,8 @@ Target: < 20 µs host per token; `top -p` shows < 1 % CPU.
 
 **P2 — Fuse at the semantic level, not the tensor level.** The unit of fusion is a *block*, not an op.
 Minimum fused kernels per decode step: `mhc_route` (concat+rmsnorm+8×dot+bias+20 sweeps+exp → ~30 flops/token),
-`mhc_merge`, `rmsnorm`, `rope_inplace`, `attn_gate_norm`, `gdn_step` (§2.4 in one kernel), `gdn_gate_norm`,
+`mhc_merge`, the two §2.7 boundary kernels (`mhc_seed`, one `mhc_expose` at the mHC → non‑mHC transition),
+`rmsnorm`, `rope_inplace`, `attn_gate_norm`, `gdn_step` (§2.4 in one kernel), `gdn_gate_norm`,
 `silu_mul`, plus one GEMM per weight. **~200 kernels/token total, ~0 for mHC.** Never emit a kernel for a `[1,T]` scalar.
 
 **P3 — F32 accumulation, f16/bf16 activations, quantised weights; precision is a per‑edge decision.**
@@ -556,7 +568,10 @@ host time per replay < 30 µs, and a repeated‑replay determinism check (bit‑
 (f32 cos/sin table precomputed for `n_ctx` × 32 pairs per §2.6), `attn_gate_norm`, and
 **`mhc_route`**: one workgroup per token reads `a,b` (8192), computes the joint RMS + the 8 dot products with the
 f32 router (split‑K over 8192), adds bias, runs all 20 sweeps on 4 f32 registers **in registers**, emits
-`in`, `post[2]`, `mix[4]` — replacing 480 nodes with **1 kernel**. Then `mhc_merge` for `a,b` updates.
+`in`, `post[2]`, `mix[4]` — replacing 480 nodes with **1 kernel**. Then `mhc_merge` for `a,b` updates, plus
+the two §2.7 boundary kernels (`mhc_seed` at the first mHC execution, `mhc_expose` at the last) — the
+program builder emits them and the gate test asserts their position, because an op count alone cannot see
+whether the data flow is right.
 **Deliverables:** each kernel + a Rust scalar oracle + `golden-check` wiring; `SN_TRACE` report before/after.
 **Gate:** every kernel NMSE ≤ 1e‑5 vs Phase 2 stage dumps; `mhc_route` NMSE ≤ 1e‑6 on `mix`; a synthetic
 micro‑benchmark showing the fused route ≥ 100× faster than the unfused equivalent; node/op count for a full
