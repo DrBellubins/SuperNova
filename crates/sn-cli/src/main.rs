@@ -26,8 +26,13 @@ usage:
          [--dump <dir>] [--dump-only p1,p2] [--iters N] [--limit-exec N] [--threads N] [--top N] [--json]
          [--logits-out <f>] [--f16-weights] [--f16-acts] [--kv-f16] [--attn-f16] [--rope-adjacent]
                                              reference forward + logits (Phase 2)
-  sn hip [info]                            device, slabs, kernel image (Phase 3)
+  sn hip [info|ops]                        device, slabs, kernel image (Phase 3);
+                                         `ops --model M [--fused|--ladder]` counts a decode step (Phase 4)
   sn bench graph [--ops N] [--reps N]      the Phase 3 graph-replay gate
+  sn bench fusion [--reps N]               fused mhc_route vs the fork's node sequence (Phase 4)
+  sn gpu kernels                           every Phase 4 kernel against its scalar oracle
+  sn gpu route --model M --dump DIR        the fused route vs Phase 2 stage dumps
+                                         (dump with: sn ref --dump DIR --dump-only mhc.,l.,l_out.,gdn.,ffn.)
 
 Token ids come from the reference tokenizer for now (`Tools/tok --ids`); the GGUF BPE tokenizer
 is Phase 10 work (Docs/design-plan.md §7).
@@ -78,6 +83,7 @@ fn run(argv: &[String]) -> sn_core::Result<String> {
         }
         Some("ref") => cmd_ref(argv, &positional, opt_val, flag),
         Some("hip") => hip::cmd_hip(&positional, opt_val, flag),
+        Some("gpu") => cmd_gpu(&positional, &opt_val),
         Some("bench") => hip::cmd_bench(&positional, opt_val),
         Some("deq") => cmd_deq(&positional, opt_val),
         Some(cmd) => Err(sn_core::Error::msg(format!(
@@ -261,6 +267,17 @@ fn cmd_ref(
 }
 
 /// "1,2,3" or one id per line, or any mix of whitespace, commas and colons.
+/// `sn gpu kernels | route`: the Phase 4 measurement surface.
+fn cmd_gpu(positional: &[String], opt_val: &impl Fn(&str) -> Option<String>) -> sn_core::Result<String> {
+    match positional.get(1).map(|s| s.as_str()) {
+        Some("kernels") => gpu::cmd_kernels(opt_val),
+        Some("route") => gpu::cmd_route(positional, opt_val),
+        _ => Ok("sn gpu kernels
+sn gpu route --model <gguf> --dump <dir> [--execs 4-11]
+".into()),
+    }
+}
+
 fn parse_ids(s: &str) -> sn_core::Result<Vec<u32>> {
     let mut out = Vec::new();
     for part in s.split(|c: char| c.is_whitespace() || c == ',' || c == ':') {
@@ -645,4 +662,5 @@ fn json_nums<T: std::fmt::Display>(v: &[T]) -> String {
     format!("[{}]", parts.join(", "))
 }
 
+mod gpu;
 mod hip;

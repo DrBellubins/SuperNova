@@ -20,7 +20,9 @@ pub fn f16_round(x: f32) -> f32 {
     f16_to_f32(f32_to_f16(x))
 }
 
-fn f32_to_f16(x: f32) -> u16 {
+/// Round an f32 to f16 bits (round-to-nearest-even). The kernel tests need the bits, not
+/// the rounded f32, because they write real f16 buffers.
+pub fn f32_to_f16(x: f32) -> u16 {
     let b = x.to_bits();
     let sign = ((b >> 16) & 0x8000) as u16;
     let exp = ((b >> 23) & 0xFF) as i32 - 127;

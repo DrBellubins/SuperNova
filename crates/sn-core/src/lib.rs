@@ -9,6 +9,7 @@
 //! * [`plan`]   — hyperparameters + the Loop/mHC execution plan (Phase 1)
 //! * [`budget`] — byte accounting per token and the "will it fit" check (Phase 1)
 //! * `numerics`, `forward` — the f32 reference forward (Phase 2)
+//! * [`oracle`] — scalar oracles for the fused HIP kernels, one per kernel (Phase 4)
 
 pub mod budget;
 pub mod dq;
@@ -16,6 +17,7 @@ pub mod error;
 pub mod forward;
 pub mod gguf;
 pub mod num;
+pub mod oracle;
 pub mod plan;
 pub mod qtypes;
 pub mod sys;

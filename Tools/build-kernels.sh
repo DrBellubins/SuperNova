@@ -46,6 +46,16 @@ for src in "$SRC"/*.hip; do
   # "Can't find declaration for hipLaunchKernel".
   "$HIPCC" "${ARCH_FLAGS[@]}" -O2 -c "$src" -o "$OUT/$base.o"
   "$OBJCOPY" --dump-section ".hip_fatbin=$OUT/$base.fatbin" "$OUT/$base.o"
+  # Record the workgroup constants the image was compiled with. A stale image is invisible at run
+  # time in the bad way: Rust picks the workgroup size and the compiled kernel indexes its shared
+  # scratch with its own `#define`, so a mismatch silently reads outside the scratch and produces
+  # wrong router logits (it did - Docs/bench.md). The loader refuses the pair instead.
+  {
+    echo "arch=${ISAS[*]}"
+    echo "sn_block=$(sed -n 's/^#define SN_BLOCK  *\([0-9]*\).*/\1/p' "$src" | head -1)"
+    echo "sn_route_threads=$(sed -n 's/^#define SN_ROUTE_THREADS  *\([0-9]*\).*/\1/p' "$src" | head -1)"
+    echo "source=$src"
+  } > "$OUT/$base.meta"
   ls -l "$OUT/$base.fatbin"
 done
 cat > "$OUT/manifest.txt" <<EOF
@@ -54,4 +64,4 @@ hipcc: $($HIPCC --version | head -1)
 isas: ${ISAS[*]}
 sources: $(ls "$SRC"/*.hip | tr '\n' ' ')
 EOF
-echo "kernel images in $OUT (SN_KERNELS=<path> overrides; default target/hip/phase3.fatbin)"
+echo "kernel images in $OUT (SN_KERNELS=a:f overrides; default: every target/hip/*.fatbin)"

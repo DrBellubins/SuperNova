@@ -146,3 +146,174 @@ leave only 2.57 GB free on this 8 GB card: the §3 KV budget is not optional.
 Not yet done (deliberately): wiring a real model's forward through the program (that is Phase 6/7 —
 it needs the kernels), and `hipGraphExec` node updates (never needed if inputs come in through pinned
 memory, which §1.1 confirms works).
+
+## 2. Phase 4 — elementwise + routing fusion (2026-11-27)
+
+### 2.0 The four gates, as commands
+
+```bash
+./Tools/build-kernels.sh gfx1102                      # -> target/hip/{phase3,phase4}.fatbin (+ .meta)
+./target/release/sn gpu kernels                       # every kernel vs its scalar oracle
+Tools/kernel-check.py --dump /tmp/stage               # routing vs Phase 2 stage dumps (real weights)
+./target/release/sn bench fusion --reps 200           # fused route vs the fork's 480-node balancing
+./target/release/sn hip ops --model $M --ladder       # launches per decode step, fusion by fusion
+cargo test --workspace                                # all of the above as tests (60 green)
+```
+
+`build-kernels.sh` output must stay visible. It failed silently once this phase (its output had been
+redirected), the old image stayed in place, and the wrong-but-plausible numbers it produced cost most
+of a debugging session — see §2.5.
+
+### 2.1 Kernel vs oracle — 25 checks, 0 failing (`sn gpu kernels`)
+
+Every kernel in `crates/sn-hip/kernels/phase4.hip` has a scalar twin in `sn-core/src/oracle.rs`; the
+harness feeds both the same buffers and compares bit-for-bit-ish (NMSE over the whole output):
+
+| kernel | NMSE | note |
+| --- | --- | --- |
+| `rmsnorm_f32` / `rmsnorm_f16` | 1.69e-13 / 6.82e-13 | f32 accumulate, `rms(x)*w` (no `(1+w)`) |
+| `add_f32` / `add_f16` | 0 | |
+| `silu_mul_f32` / `swiglu_f32` | 1.61e-18 | |
+| `sigmoid_f32` | 1.07e-16 | |
+| `rope_inplace_f32` / `_f16` | 2.93e-16 / 1.38e-8 | half-offset pairs `(p, p+n_rot/2)` (§2.6 of the plan) |
+| `attn_gate_norm_f32` | 4.36e-19 | strided gate, 16 q-heads sharing a 4-head gate |
+| `mhc_route_f32` logits / input / post / **mix** | 1.72e-16 / 6.25e-16 / 0 / **6.17e-13** | mix gate is 1e-6 |
+| `mhc_merge_f32` a / b | 1.80e-15 / 1.95e-15 | reads pre-merge streams |
+| `mhc_seed_f32` a / b, `mhc_expose_f32` cur | 0 / 0 / 0 | the two ends of the mHC region (§2.7); added with the program-boundary fix below |
+
+The f16 variants sit at the f16 quantisation floor (4.88e-4 relative, `oracle::f16_rel`), which is the
+only honest floor for a kernel whose job is to *store* f16.
+
+**The check is calibrated with a control that must fail:** the same kernel run with 6 Sinkhorn sweeps
+instead of the checkpoint's 20 misses `mix` by NMSE 3.3e-3. If that control ever passes, the mix check
+has stopped measuring the sweeps.
+
+### 2.2 Routing replayed against Phase 2 — GATE: PASS (`Tools/kernel-check.py`)
+
+The synthetic oracle cannot prove the router is right about *this checkpoint*, so the kernels are also
+run against `sn ref`'s stage dumps: the reference decodes `p1-capital`, dumps
+`mhc.<il>.{a,b,logits,post,mix}`, `l.<il>.{h,h2}`, `l_out.<il>`, and the GPU recomputes each of them
+from the dumped pre-merge streams plus the real `blk.N.hc_*_fn.weight/bias/norm` tensors.
+
+```
+executions 4..11 (all 8 trunk mHC executions in the dump)
+worst NMSE: mix 4.502e-15 (gate 1e-6), every other stage 8.654e-13 (gate 1e-5)
+GATE: PASS
+```
+
+Per execution that is 10 checks (attn logits/post/mix, `l.<il>.h`, ffn logits/mix, `l.<il>.h2`, both
+merged streams, and a host-side oracle line). The oracle line exists to localise a failure: if the
+*host* oracle misses the golden too, the harness read the wrong stage files; if only the kernel misses,
+the defect is in the kernel with exactly those bytes.
+
+*Note on the figures:* the stage dump is an **input** to this gate. For a fixed dump the GPU side is
+bit-reproducible (`sn gpu route` twice → the same 1.854e-14 / 4.005e-13), but regenerating the dump
+with `sn ref` moved these residuals from 4.5e-15 / 8.65e-13 to 1.85e-14 / 4.00e-13 (re-measured
+2026-11-27 after the program-boundary fix). Both are ~9 orders of magnitude inside the gate; read these
+numbers as magnitudes, not as a hash of the run.
+
+`Docs/golden` is unchanged, and `Tools/golden-check.py --floor-dir Docs/golden/ref-cpu/ref` still
+reports the Phase 2 closure numbers to three significant figures (1.79e-3 / 9.57e-3 / 8.87e-3 /
+2.37e-3 / 4.85e-2, top-1 5/5): the refactor that moved `forward.rs::route/merge` onto the oracles is
+arithmetic-neutral. The two prompts that fail that gate are §2.9's open attention item, unchanged.
+
+### 2.3 Fusion — 486 nodes → 1 kernel, 150× (`sn bench fusion --reps 200`)
+
+The unfused baseline is the fork's spelling of the same route (`sn_ub_*` nodes: `sub`, `neg`,
+`softplus`, `gemv8`, `bias_add`, `sigmoid_post`, `exp4`, `mix_ab`) — 486 launches, including the whole
+8-row router matmul and `in` given to it as single nodes so the claim is not flattered by a strawman:
+
+| | launches | flat (ms/route) | graph (ms/route) |
+| --- | --- | --- | --- |
+| unfused | 486 | 3.955 | 3.845 |
+| fused `sn_mhc_route_f32` | 1 | 0.0219 | 0.0254 |
+| **speedup** | | 84.6× … 180.5× | **150.5× … 151.1×** |
+
+The graph leg is what the plan's ≥ 100× is tested against, because Phase 3 established the engine
+replays captured graphs. The node-by-node number is printed but does not gate: it is bimodal (22.0 µs
+or 46.7 µs for the same single launch, stable within a process), and a timing gate that depends on
+which mode a process lands in is not a gate. The device time is the graph number, 25.4 µs.
+
+At 96 routing applications per decode step that is 2.4 ms of device time per token (6 % of the ~40 ms
+weight-traffic budget), against 96 × 3.85 ms = 370 ms unfused — before counting the host work the fork
+spends building those nodes, which is what §4.2 of the plan measured at 4,700 launches/token.
+
+### 2.4 Launches per decode step — the ≤ 300 target is NOT met (`sn hip ops --ladder`)
+
+The plan asks for ≤ 300 nodes per decode step. With every Phase 4 fusion turned on, the real checkpoint
+still needs **669** (raw, one kernel per step of §2: **1011**):
+
+```
+raw (one kernel per step of §2):  1011 launches ( 463 launchable today)
++ norm -> gemv:   899 launches ( 351)  -112
++ silu -> gemv:   843 launches ( 295)  -56
++ multi-gemv:   759 launches ( 295)  -84
++ rope -> gemv:   731 launches ( 267)  -28
++ gate -> gemv:   717 launches ( 253)  -14
++ route+merge (= P2 target):   669 launches ( 109)  -48
+```
+
+and 669 breaks down as `gemv 267, recur 154, merge 98, route 48, gate 42, silu 42, add 16, input 1,
+norm 1` — i.e. 267 weight matrices (irreducible: one per matrix, and `multi_gemv` already batched what
+shares an input), 154 GDN recurrent inner kernels (Phase 6 fuses them per head), and 146 mHC
+route/merge/seed/expose kernels (96 routing applications before fusing, plus the two boundary ops §2.7
+requires: one seed at the first mHC execution, one exposure at the last). Phase 4 *halves* the routing
+kernels (96 → 48 by folding the ffn route into its merge); nothing in Phase 4 can touch the other 421.
+
+*(2026-11-27, review of Phases 0–4: three defects in the program builder were fixed and are inside the
+numbers above. Nothing wrote `a`/`b` before the first route read them — `sn_mhc_seed_f32` does now, with
+`oracle::mhc_seed` beside it; the `0.5*(a+b)` exposure sat in the **head** instead of the mHC → non-mHC
+boundary, which would have left the exit blocks (`blk.52..55`) reading a `cur` last written at execution 3
+and fed the head the loop's streams instead of block 55's output — it is emitted at the boundary now, and
+`sn_mhc_expose_f32` is a real kernel rather than a pending name; and the fused ladder launched the
+post-attention norm *and* folded it into the gate/up GEMV for the eight non-mHC blocks (the `-104` row
+is now `-112`, and `norm 9` is now `norm 1`, the output norm). Those numbers are the −8 +2 between the
+previous 676/1010 and these. `phase4_decode_step_op_counts_are_recorded` now asserts the structure —
+exactly one seed, before the first route; exactly one exposure, before the exit blocks; no explicit
+post-norm in a program that folds it — because counting ops alone did not see any of this.*
+
+So the ≤ 300 figure is reported as **not met and not reachable by fusion alone**: it needs the GEMM
+batching that Phase 5/7 own (one batched launch per execution rather than per matrix). Phase 3 set the
+exchange rate that makes this survivable — 2.9 µs per node inside a graph, so 669 nodes ≈ 1.9 ms of
+dispatch against ~40 ms of weight traffic. `phase4_decode_step_op_counts_are_recorded` asserts the
+measured structure (fused < raw, routing halved, ≥ 96 applications, the two §2.7 boundaries in the right
+order) and *panics if the count ever drops to ≤ 300*, so the claim has to be edited deliberately rather
+than drifting.
+
+### 2.5 Two kernel measurements, and one bug that produced wrong numbers silently
+
+* **`log1pf` has no GCN instruction.** The Sinkhorn sweep in `sn_mhc_route_f32` was `-softplus(±d)`
+  spelled as the reference spells it (`x > 20 ? x : log1pf(expf(x))`): 80 software calls per thread in
+  series = 25 µs of the kernel's runtime. The same renormalisation written as a log-sum-exp pair update
+  — `m_i' = m_i − lse(m_i, m_j)` with `lse = max + logf(1 + expf(−|d|))` — is one `exp` and one `log`
+  per pair instead of two of each, and *improved* accuracy against the oracle (mix NMSE 2.9e-17 →
+  6.2e-13 with the float4 accumulation below; the unfused baseline keeps `log1pf` because that is what
+  the fork runs).
+* **The route is memory-latency bound, and only one workgroup runs.** Reading the `8×8192` f32 router
+  (256 KB) with 256 scalar-loading threads ran at ~8 GB/s. `float4` loads of `a`, `b` and the router,
+  and a 1024-thread workgroup (`SN_ROUTE_THREADS`, mirrored as `ops::ROUTE_BLOCK`), took one route from
+  55.5 µs to 25.4 µs (2.2×), which is what turned 82× into 150×.
+* **The bug: a stale kernel image and a workgroup-size mismatch.** The scratch of `sn_mhc_route_f32` is
+  `__shared__ float red[SN_NROUTE * SN_ROUTE_THREADS]`, indexed by the *compiled* stride while the
+  launcher picks the *runtime* workgroup size. With the fatbin built for one size and Rust launching
+  another, the reduction reads outside `red`: every router logit but the first came back wrong, the
+  numbers moved when the `sharedBytes` launch argument changed, and nothing errored. `Tools/build-kernels.sh`
+  now records `sn_block` / `sn_route_threads` next to each image (`target/hip/*.meta`) and
+  `KernelRegistry::add_image` refuses to load an image whose constants disagree with the Rust side.
+  Passing the static footprint as a *dynamic* shared size was also wrong (it reserves a second 32 KB
+  region); every route launch passes 0 — `decode::route_static_shared()` documents the footprint instead.
+
+### 2.6 What Phase 4 is (files)
+
+* `crates/sn-core/src/oracle.rs` — the scalar twins, `nmse`/`max_abs`/`f16_rel`, `read_stage`, and the
+  single implementation of routing (`route_derive`, `mhc_route`, `mhc_merge`) that `forward.rs` now
+  calls, so the reference and the kernels cannot drift apart.
+* `crates/sn-hip/kernels/phase4.hip` — the engine kernels + the `sn_ub_*` unfused baseline.
+* `crates/sn-hip/src/ops.rs` — `SPECS` (name, dtype, workgroup), `register_phase4`, `Kernels::resolve`,
+  `grid1d`; `BLOCK = 256`, `ROUTE_BLOCK = 1024`.
+* `crates/sn-hip/src/decode.rs` — `compile()` → `ProgramSpec` (the op list of one decode step, with
+  `Fusion` flags and the ladder), `Slots::reserve`, and the named *pending* kernels for Phase 5/6 so the
+  counts above include kernels that do not exist yet.
+* `crates/sn-hip/src/check.rs` — `Harness`, `kernel_checks`, `route_vs_golden`, `fusion_gate`, `report`.
+* `crates/sn-cli/src/gpu.rs` — `sn gpu kernels`, `sn gpu route`, `sn bench fusion`, `sn hip ops`.
+* `crates/sn-hip/tests/{phase4.rs,phase4_fusion.rs,common/mod.rs}`, `Tools/kernel-check.py`.

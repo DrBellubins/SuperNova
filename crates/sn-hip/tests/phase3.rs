@@ -5,14 +5,15 @@
 //! kernel image has not been built, the test prints a skip line instead of failing. Run
 //! `./Tools/build-kernels.sh` first to make it real; `SN_KERNELS` overrides the image path.
 
-use sn_hip::bench::{image_path, register_probes, run_graph_gate};
+use sn_hip::bench::{image_paths, register_probes, run_graph_gate};
 use sn_hip::kernels::KernelRegistry;
 use sn_hip::Substrate;
 
 fn substrate() -> Option<(Substrate, KernelRegistry)> {
-    let image = image_path();
-    if !std::path::Path::new(&image).exists() {
-        eprintln!("skip: kernel image {image} is not built (run ./Tools/build-kernels.sh)");
+    let images = image_paths();
+    let missing: Vec<&String> = images.iter().filter(|p| !std::path::Path::new(p.as_str()).exists()).collect();
+    if !missing.is_empty() {
+        eprintln!("skip: kernel image(s) {} are not built (run ./Tools/build-kernels.sh)", missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
         return None;
     }
     let sub = match Substrate::open() {
@@ -22,10 +23,10 @@ fn substrate() -> Option<(Substrate, KernelRegistry)> {
             return None;
         }
     };
-    let mut reg = match KernelRegistry::load_image(&sub.dev, &image) {
+    let mut reg = match KernelRegistry::load_image(&sub.dev, &images[0]) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("skip: cannot load {image} ({e})");
+            eprintln!("skip: cannot load {} ({e})", images[0]);
             return None;
         }
     };

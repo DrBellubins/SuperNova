@@ -146,3 +146,51 @@ Results:
   rather than logits to find a defect — logits amplify.
 * Do not "optimise" the 20 sweeps: they are the trained iterate (`num::tests` pins the difference
   against 6 and against convergence).
+
+## 5. Phase 4: the same rules, now in HIP (2026‑11‑27)
+
+The kernels do not get their own numerics. They get the §1 rules, a scalar oracle in
+`sn-core/src/oracle.rs` that states each rule once, and a comparison of the two — plus a comparison
+against the Phase 2 dumps, because agreement with my own oracle proves only that the kernel implements
+*something* consistently.
+
+* **One implementation of routing, three consumers.** `oracle::route_derive` / `mhc_route` / `mhc_merge`
+  are what `forward::RefModel::route`/`merge` call, what the checks compare against, and what the
+  kernels were written from. `forward.rs` no longer contains a second copy, so the reference, the oracle
+  and the kernel cannot drift independently. (`golden-check` reproduces the Phase 2 closure numbers
+  exactly after the move: 1.79e‑3 / 9.57e‑3 / 8.87e‑3 / 2.37e‑3 / 4.85e‑2, top‑1 5/5.)
+* **Measured:** kernel vs oracle, 25 checks, worst f32 NMSE 1.69e‑13; `mix` 6.17e‑13 against its 1e‑6
+  gate. Kernel vs Phase 2 dumps on real weights (executions 4..11): worst `mix` 4.5e‑15, worst other
+  stage 8.65e‑13. Details and commands: `Docs/bench.md` §2.1–2.2.
+* **The mHC region has two ends, and both are now ops.** §2.7 creates the streams at the first mHC
+  execution (`a = b = cur`) and hands the trunk `0.5·(a+b)` at the last one — the value the *next*
+  execution reads, which for this checkpoint is the first exit block (`blk.52`), not the output head.
+  `oracle::mhc_seed` / `oracle::mhc_expose` are the spec, `sn_mhc_seed_f32` / `sn_mhc_expose_f32` the
+  kernels (NMSE 0), and `decode::compile` places both by walking the plan's mHC boundaries. Seeding
+  then exposing is the identity — which is exactly why an unseeded program reports plausible numbers
+  instead of an error: it scores whatever the previous token left in the stream slots.
+* **The sweep rewrite is an identity, not a truncation.** `sn_mhc_route_f32` computes the pair update as
+  `m_i' = m_i − lse(m_i, m_j)`, `m_j' = m_j − lse(...)`, which equals the reference's
+  `m_i' = −softplus(−(m_i−m_j))`, `m_j' = −softplus(m_i−m_j)` by definition of `lse`; it exists because
+  `log1pf` compiles to a software fallback on GCN and 80 serial calls per thread dominated the kernel.
+  `logf(1 + exp(−|d|))` differs from `log1p(exp(−|d|))` by at most `exp(−|d|)/2` in absolute terms — for
+  `|d| > 17` that is below the f32 resolution of the result, and every sweep renormalises anyway. Measured
+  against the oracle: mix NMSE 6.17e‑13 (the pre-rewrite form was 2.85e‑17 — the difference is the
+  float4 accumulation order, not the sweeps). The *unfused baseline* keeps `log1pf` verbatim: it has to
+  look like the fork's nodes, and its speed is not the point.
+* **`fixed_identity` dumps differently now.** With `mhc.fixed_identity = true` the mix is now
+  `[1, 0, 0, 1]` (the identity, as the flag says) where the Phase 2 dump code wrote `[1, 1, 1, 1]`.
+  Both are dead code for this checkpoint (`fixed_identity false`, pinned by the `mhc_route_f32 mix
+  (fixed_identity)` check), but a future dump of a model that sets the flag will not be comparable to an
+  old one.
+* **f16 in / f16 out is a store, not a computation.** The f16 kernels accumulate in f32 and round once,
+  so their floor is the f16 quantisation step (relative 4.88e‑4, `oracle::f16_rel`) and *not* 1e‑5; the
+  checks say so with a separate gate. `sn_from<T>`/`sn_to<T>` are explicit template specialisations
+  because an `sn_h(float) -> __half` overload quietly routed every f32 path through f16 (measured:
+  `rmsnorm_f32` NMSE 4e‑8, `silu_mul_f32` → inf).
+* **A kernel can be wrong without any API noticing.** The reduction scratch of `sn_mhc_route_f32` is
+  sized by a `#define` in the `.hip` while the workgroup size is chosen in Rust; with the two disagreeing
+  the reduction reads outside its array and returns wrong logits for every row but the first — silently,
+  deterministically, and differently whenever the launch's `sharedBytes` changes. `target/hip/*.meta`
+  (written by `Tools/build-kernels.sh`) and `KernelRegistry::add_image` (which refuses the mismatch) are
+  the guard; `decode::route_static_shared()` documents why the dynamic shared size must be 0.

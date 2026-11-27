@@ -2,7 +2,7 @@
 //! allocated, and the graph-replay gate with its numbers.
 
 use sn_core::Result;
-use sn_hip::bench::{image_path, register_probes, run_graph_gate};
+use sn_hip::bench::{image_paths, open_registry, register_probes, run_graph_gate};
 use sn_hip::KernelRegistry;
 use sn_hip::Substrate;
 
@@ -10,22 +10,38 @@ use sn_hip::Substrate;
 pub fn cmd_hip(
     positional: &[String],
     opt_val: impl Fn(&str) -> Option<String>,
-    _flag: impl Fn(&str) -> bool,
+    flag: impl Fn(&str) -> bool,
 ) -> Result<String> {
     let mut sub = Substrate::open()?;
     let mut out = String::new();
     out += &format!("{}\n", sub.dev.info);
-    let image = opt_val("--kernels").unwrap_or_else(image_path);
-    match KernelRegistry::load_image(&sub.dev, &image) {
-        Ok(reg) => {
-            let mut reg = reg;
-            register_probes(&sub, &mut reg)?;
-            out += &format!("kernel image {image}: {} registered\n", reg.len());
-            for k in reg.keys() {
-                out += &format!("  {k}\n");
-            }
+    let paths = match opt_val("--kernels") {
+        Some(v) => vec![v],
+        None => image_paths(),
+    };
+    let mut reg = KernelRegistry::new();
+    let mut loaded = Vec::new();
+    for p in &paths {
+        match reg.add_image(&sub.dev, p) {
+            Ok(()) => loaded.push(p.clone()),
+            Err(e) => out += &format!("kernel image {p}: {e}\n"),
         }
-        Err(e) => out += &format!("kernel image: {e}\n"),
+    }
+    if !loaded.is_empty() {
+        // The graph probes plus the Phase 4 elementwise/routing set, so `sn hip info` lists what a
+        // decode program can actually launch today.
+        register_probes(&sub, &mut reg)?;
+        let phase4 = sn_hip::ops::register_phase4(&sub.dev, &mut reg);
+        out += &format!("kernel images {}: {} registered\n", loaded.join(" "), reg.len());
+        if let Err(e) = phase4 {
+            out += &format!("  (Phase 4 kernel set not registered: {e})\n");
+        }
+        for k in reg.keys() {
+            out += &format!("  {k}\n");
+        }
+    }
+    if positional.get(1).map(|s| s.as_str()) == Some("ops") {
+        return crate::gpu::cmd_ops(positional, &opt_val, &flag);
     }
     if let Some(model) = opt_val("--weights") {
         // The single-allocation weight path: one hipMalloc + one hipMemcpy of the data section.
@@ -60,8 +76,14 @@ pub fn cmd_hip(
 
 /// `sn bench graph`: the Phase 3 acceptance gate (design-plan §7).
 pub fn cmd_bench(positional: &[String], opt_val: impl Fn(&str) -> Option<String>) -> Result<String> {
-    if positional.get(1).map(|s| s.as_str()) != Some("graph") {
-        return Ok("sn bench graph [--ops N] [--reps N] [--steps-per-op K] [--kernels PATH]\n".into());
+    match positional.get(1).map(|s| s.as_str()) {
+        Some("fusion") => return crate::gpu::cmd_fusion(&opt_val),
+        Some("graph") => {}
+        _ => {
+            return Ok("sn bench graph  [--ops N] [--reps N] [--steps-per-op K] [--kernels PATH]
+                      sn bench fusion [--reps N] [--sweeps N] [--model M]
+".into())
+        }
     }
     let num = |name: &str, d: usize| -> Result<usize> {
         match opt_val(name) {
@@ -75,8 +97,7 @@ pub fn cmd_bench(positional: &[String], opt_val: impl Fn(&str) -> Option<String>
     let reps = num("--reps", 200)?;
 
     let mut sub = Substrate::open()?;
-    let image = opt_val("--kernels").unwrap_or_else(image_path);
-    let mut reg = KernelRegistry::load_image(&sub.dev, &image)?;
+    let mut reg = open_registry(&sub.dev)?;
     register_probes(&sub, &mut reg)?;
     let gate = run_graph_gate(&mut sub, &reg, ops, reps, num("--steps-per-op", 1)?)?;
     let mut out = gate.report();

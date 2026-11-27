@@ -562,6 +562,54 @@ f32 router (split‑K over 8192), adds bias, runs all 20 sweeps on 4 f32 registe
 micro‑benchmark showing the fused route ≥ 100× faster than the unfused equivalent; node/op count for a full
 decode step ≤ **300**.
 
+**Status (2026‑11‑27): three gates pass, the fourth (≤ 300) is reported as not met and not reachable by
+fusion alone.** All numbers: `Docs/bench.md` §2.
+
+* **Kernels vs their oracles — PASS.** 25 checks, 0 failing (`sn gpu kernels`; 22 plus the mHC
+  seed/expose pair added on 2026‑11‑27): the worst f32 kernel is
+  `rmsnorm_f32` at NMSE 1.69e‑13, `mix` at 6.17e‑13 (gate 1e‑6), the f16 variants at the f16 store floor.
+  Calibrated by a control that must fail: the same kernel with 6 sweeps instead of 20 misses `mix` by
+  3.3e‑3.
+* **`mhc_route` vs the Phase 2 dumps — PASS.** Executions 4..11 of `p1-capital`, real router weights,
+  recomputing logits / post / mix / `in` / both merged streams: worst `mix` NMSE **4.5e‑15**, worst other
+  stage **8.65e‑13** (`Tools/kernel-check.py`). Each run also scores a host‑side oracle line so a
+  divergence names its side. `Docs/golden` is untouched and `golden-check` still reproduces the Phase 2
+  closure numbers exactly — moving `forward::route/merge` onto the oracles changed no arithmetic.
+* **Fused route ≥ 100× the unfused sequence — PASS at 150×.** 486 unfused nodes (the fork's own
+  spelling, given the router matmul and `in` as single nodes so it is not a strawman) = 3.845 ms per
+  route as a graph; one `sn_mhc_route_f32` = 25.4 µs → **150.5×**. The node‑by‑node number is printed
+  but does not gate: the same single launch lands in one of two submission‑latency modes (22.0 or
+  46.7 µs), so it reads 85× … 180× and is not a gate. Two fixes made the difference: `log1pf` has no
+  GCN instruction (the sweep pair update became a log‑sum‑exp, −25 µs), and the router read needed
+  `float4` plus a 1024‑thread workgroup (55.5 → 25.4 µs).
+* **≤ 300 launches per decode step — NOT MET: 669 fused, 1011 raw.** Breakdown at full fusion:
+  `gemv 267, recur 154, merge 98, route 48, gate 42, silu 42, add 16, input 1, norm 1`. 267 weight
+  matrices and 154 GDN recurrent kernels are outside Phase 4's reach; Phase 4's own claim holds —
+  routing goes from 96 kernels to 48 (and from 480 graph nodes to 1 kernel each), plus the two
+  boundary ops §2.7 requires (seed the streams at the first mHC execution, expose `0.5·(a+b)` at the
+  last). Meeting 300 needs the per-execution GEMM batching that Phase 5/7 own; with Phase 3's 2.9 µs
+  per node inside a graph, 669 nodes is ~1.9 ms of dispatch against ~40 ms of weight traffic, so the
+  target is worth revisiting as a *Phase 7* line rather than pretending fusion delivers it.
+  `phase4_decode_step_op_counts_are_recorded` panics if the count ever reaches ≤ 300, so the docs have
+  to be edited on purpose.
+* **Review of Phases 0–4 (2026-11-27) — three program-builder defects fixed, and they are why the
+  counts above differ from the first Phase 4 run.** The decode program never seeded the mHC streams
+  (the first route read buffers nothing wrote: `sn_mhc_seed_f32` + `oracle::mhc_seed` now exist), put
+  the `0.5·(a+b)` exposure in the output head instead of at the mHC → non-mHC boundary (the exit
+  blocks `blk.52..55` would have read a `cur` last written at execution 3, and the head would have
+  scored the loop's streams instead of block 55's output), and applied the post-attention norm twice
+  for the eight non-mHC blocks under `norm → gemv`. Counting ops could not see any of it, so the
+  gate test now asserts the data-flow structure instead. Fixed before Phase 6, where they would have
+  been numerics hunts.
+* Tooling worth keeping: `build-kernels.sh` now writes `target/hip/*.meta` and the loader **refuses** an
+  image whose `#define`d workgroup size disagrees with the Rust launch size — a mismatch silently read
+  outside the reduction scratch and produced wrong router logits with no error anywhere.
+* **Deferred honestly:** the deliverable “`SN_TRACE` report before/after” is the launch-count ladder
+  (`sn hip ops --model … --ladder`, `Docs/bench.md` §2.4), not a literal trace. A trace needs a decode
+  program that *launches*; today `compile()` produces a `ProgramSpec` whose 669 ops include 560 kernels
+  that Phase 5/6 have not written yet. `SN_TRACE` over the real step belongs to Phase 7, where the plan
+  already asks for it (≤ 300 ops visible there).
+
 ### Phase 5 · Quantised GEMM for Q2_K / Q4_K / f32 (5–8 days) — the bandwidth half
 Decode (T=1) path first: memory‑bound `gemv`, warp‑per‑superblock, `__builtin_amdgcn_` 16‑bit packed ops for the
 4/6‑bit unpack (`Q4_K` + `Q6_K` are the only quantised types in the checkpoint), 128‑byte loads, one pass, f32

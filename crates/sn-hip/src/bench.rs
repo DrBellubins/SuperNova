@@ -16,17 +16,49 @@ use std::time::Instant;
 use sn_core::error::{Error, Result};
 
 use crate::arena::Arena;
-use crate::hip::check;
+use crate::hip::{check, Device};
 use crate::kernels::{DType, Key, KernelRegistry};
 use crate::program::{Arg, Graph, Program, ProgramBuilder, Timer};
 use crate::Substrate;
 
-/// Where the kernel image is. `SN_KERNELS` overrides; the default is what Tools/build-kernels.sh
-/// writes.
+/// Where the kernel images live. `SN_KERNELS=a:f` overrides; the default is every image
+/// `Tools/build-kernels.sh` wrote, because from Phase 4 on the engine needs more than one
+/// (`phase3.fatbin` carries the graph probes, `phase4.fatbin` the elementwise and routing set).
+pub const DEFAULT_DIR: &str = "target/hip";
+/// Only used to name a path in an error when the directory does not exist at all.
 pub const DEFAULT_IMAGE: &str = "target/hip/phase3.fatbin";
 
-pub fn image_path() -> String {
-    std::env::var("SN_KERNELS").unwrap_or_else(|_| DEFAULT_IMAGE.to_string())
+pub fn image_paths() -> Vec<String> {
+    if let Ok(v) = std::env::var("SN_KERNELS") {
+        let v: Vec<String> = v.split(':').map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    let mut out: Vec<String> = match std::fs::read_dir(DEFAULT_DIR) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "fatbin").unwrap_or(false))
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        Err(_) => return vec![DEFAULT_IMAGE.to_string()],
+    };
+    out.sort();
+    if out.is_empty() {
+        out.push(DEFAULT_IMAGE.to_string());
+    }
+    out
+}
+
+/// Load every kernel image and return the registry. Model-load-time only.
+pub fn open_registry(dev: &Device) -> Result<KernelRegistry> {
+    let paths = image_paths();
+    let mut reg = KernelRegistry::load_image(dev, &paths[0])?;
+    for p in &paths[1..] {
+        reg.add_image(dev, p)?;
+    }
+    Ok(reg)
 }
 
 /// Register the Phase 3 probe kernels under their keys.

@@ -11,10 +11,7 @@ use std::io::Write;
 use crate::dq::{f16_round, Mat};
 use crate::error::{Error, Result};
 use crate::gguf::Gguf;
-use crate::num::{
-    apply_rope, l2_norm, rms_norm, rms_norm_w, silu, sigmoid, softplus, sinkhorn_sweeps,
-    Rope, RopePairing,
-};
+use crate::num::{apply_rope, l2_norm, rms_norm, rms_norm_w, silu, sigmoid, softplus, Rope, RopePairing};
 use crate::plan::{Exec, Plan};
 use crate::qtypes;
 use crate::require;
@@ -291,8 +288,9 @@ impl<'a> RefModel<'a> {
         flat.extend_from_slice(a);
         flat.extend_from_slice(b);
         let mut normed = vec![0.0f32; flat.len()];
-        // 1e-6 is hard-coded in the reference for this norm, not the model's rms epsilon.
-        rms_norm(&flat, 1e-6, &mut normed);
+        // 1e-6 is hard-coded in the reference for this norm, not the model's rms epsilon
+        // (`oracle::MHC_EPS`, shared with the kernel oracle).
+        rms_norm(&flat, crate::oracle::MHC_EPS, &mut normed);
         let w = self.mat(&tname(block, &format!("{fn_}.weight")))?;
         let bias = self.gain(&tname(block, &format!("{fn_}.bias")))?;
         let n_route = dm.n_route;
@@ -303,23 +301,19 @@ impl<'a> RefModel<'a> {
             logits[i] += bias[i];
         }
         d.dump(&format!("mhc.{tag}.logits"), &format!("{n_route}"), &logits)?;
-        let (s0, s1) = (sigmoid(logits[0]), sigmoid(logits[1]));
-        let input = (0..a.len())
-            .map(|i| (a[i] * s0 + b[i] * s1) * hp.mhc_pre_scale)
-            .collect();
-        let post = [sigmoid(logits[2]) * 2.0, sigmoid(logits[3]) * 2.0];
-        let mut mix = if hp.mhc_fixed_identity {
-            [1.0f32; 4]
-        } else {
-            [logits[4], logits[5], logits[6], logits[7]]
-        };
-        sinkhorn_sweeps(&mut mix, self.iters.unwrap_or(hp.mhc_iters));
-        // The sweeps run in log space; the reference exponentiates after the last one, so `mix` is
-        // the doubly stochastic mixing matrix by the time `merge` uses it (§2.7). Without this the
-        // merge multiplies the streams by negative log-mix values and the residual blows up.
-        for m in mix.iter_mut() {
-            *m = m.exp();
-        }
+        // Everything after the logits is shared with the kernel oracle (`oracle::route_derive`), so
+        // the reference forward and the Phase 4 kernel spec cannot drift apart.
+        let (input, post, mix) = crate::oracle::route_derive(
+            a,
+            b,
+            &logits,
+            &crate::oracle::RouteParams {
+                eps: crate::oracle::MHC_EPS,
+                pre_scale: hp.mhc_pre_scale,
+                sweeps: self.iters.unwrap_or(hp.mhc_iters),
+                fixed_identity: hp.mhc_fixed_identity,
+            },
+        );
         d.dump(&format!("mhc.{tag}.post"), "2", &post)?;
         d.dump(&format!("mhc.{tag}.mix"), "4", &mix)?;
         Ok(Route {
@@ -330,13 +324,12 @@ impl<'a> RefModel<'a> {
         })
     }
 
-    /// `a' = a*mix0 + b*mix1 + branch*post0` and the mirror for `b`, both from the pre-merge streams.
+    /// `a' = a*mix0 + b*mix1 + branch*post0` and the mirror for `b`, both from the pre-merge
+    /// streams. The arithmetic lives in `oracle::mhc_merge`, next to the kernel that does it.
     fn merge(a: &mut [f32], b: &mut [f32], branch: &[f32], r: &Route) {
-        for i in 0..a.len() {
-            let (ai, bi) = (a[i], b[i]);
-            a[i] = ai * r.mix[0] + bi * r.mix[1] + branch[i] * r.post[0];
-            b[i] = ai * r.mix[2] + bi * r.mix[3] + branch[i] * r.post[1];
-        }
+        let (na, nb) = crate::oracle::mhc_merge(a, b, branch, &r.mix, &r.post);
+        a.copy_from_slice(&na);
+        b.copy_from_slice(&nb);
     }
 
     /// Full attention for one token against the execution's own KV cache (§2.3).

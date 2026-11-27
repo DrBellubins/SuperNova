@@ -146,6 +146,22 @@ impl KernelRegistry {
     }
 
     pub fn add_image(&mut self, dev: &Device, path: &str) -> Result<()> {
+        let meta = std::path::Path::new(path).with_extension("meta");
+        if let Ok(text) = std::fs::read_to_string(&meta) {
+            for (key, want) in [
+                ("sn_block", crate::ops::BLOCK),
+                ("sn_route_threads", crate::ops::ROUTE_BLOCK),
+            ] {
+                if let Some(got) = meta_u32(&text, key) {
+                    if got != want {
+                        return Err(Error::msg(format!(
+                            "{path} was compiled with {key}={got} but this build of sn-hip launches that kernel with {want}: \
+                             the kernel image is stale. Run Tools/build-kernels.sh, and do not send \
+                             its output to /dev/null: a failed compile leaves the old image in place.")));
+                    }
+                }
+            }
+        }
         self.modules.push(Module::load(dev, path)?);
         Ok(())
     }
@@ -227,6 +243,15 @@ fn shape_for_msg(shape: &[i64]) -> String {
     } else {
         shape.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("x")
     }
+}
+
+/// `key=value` from a `Tools/build-kernels.sh` sidecar file. Absent, empty, or unparsable reads as
+/// absent: the sidecar is a guard, not a required input.
+fn meta_u32(text: &str, key: &str) -> Option<u32> {
+    text.lines().find_map(|l| {
+        let (k, v) = l.split_once('=')?;
+        if k.trim() == key { v.trim().parse::<u32>().ok() } else { None }
+    })
 }
 
 #[cfg(test)]

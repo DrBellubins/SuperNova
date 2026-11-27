@@ -18,8 +18,11 @@
 
 pub mod arena;
 pub mod bench;
+pub mod check;
+pub mod decode;
 pub mod hip;
 pub mod kernels;
+pub mod ops;
 pub mod program;
 
 use std::ffi::c_void;
@@ -27,6 +30,7 @@ use std::ffi::c_void;
 pub use arena::{Arena, Layout, Slot};
 pub use hip::{Device, DeviceInfo, HipApi};
 pub use kernels::{DType, Key, Kernel, KernelRegistry};
+pub use ops::{Kernels, BLOCK as KERNEL_BLOCK};
 pub use program::{Arg, Graph, Op, OpKind, Program, ProgramBuilder, Trace};
 
 use sn_core::error::{Error, Result};
@@ -70,6 +74,13 @@ impl Slab {
 
     pub fn ptr(&self) -> *mut c_void {
         self.ptr
+    }
+
+    /// Allocate a slab outside the substrate's three. The check harness uses it for the handful of
+    /// tensors a stage check needs (the mHC routers) instead of uploading the whole 5.8 GB weight
+    /// slab; the engine itself never calls this.
+    pub fn new(api: &HipApi, len: usize, what: &str) -> Result<Slab> {
+        Slab::alloc(api, len, what)
     }
     pub fn addr(&self) -> u64 {
         self.ptr as u64
