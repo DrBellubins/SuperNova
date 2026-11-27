@@ -56,6 +56,32 @@ for src in "$SRC"/*.hip; do
     echo "sn_route_threads=$(sed -n 's/^#define SN_ROUTE_THREADS  *\([0-9]*\).*/\1/p' "$src" | head -1)"
     echo "sn_gemv_block=$(sed -n 's/^#define SN_GEMV_BLOCK  *\([0-9]*\).*/\1/p' "$src" | head -1)"
     echo "source=$src"
+    # The parameter count of every __global__ in the image. `ProgramSpec::build` compares it against
+    # the argument list each launch carries: HIP does not check that, and an extra or missing
+    # argument is a wrong *number*, not a fault (an extra `n_v_heads` before `d_v` made the GDN
+    # gated norm read `d_v = 32` and produced a plausible-looking wrong forward - Docs/bench.md §4).
+    # Absent sidecars are allowed: the guard degrades to no check.
+    if [ -n "${PYTHON:-python3}" ] && command -v "${PYTHON:-python3}" >/dev/null 2>&1; then
+      "${PYTHON:-python3}" - "$src" <<'PY'
+import re, sys
+src = open(sys.argv[1]).read()
+# Join a signature that wraps, then count top-level commas between the outer parentheses.
+for m in re.finditer(r'__global__\s+void\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(', src):
+    name, i, depth, j = m.group(1), m.end() - 1, 0, m.end() - 1
+    while True:
+        c = src[j]
+        depth += (c == '(') - (c == ')')
+        if depth == 0:
+            break
+        j += 1
+    args = src[i + 1:j]
+    d, n = 0, 0
+    for c in args:
+        d += (c in '([') - (c in ')]')
+        n += (c == ',' and d == 0)
+    print(f"argc_{name}={0 if not args.strip() or args.strip() == 'void' else n + 1}")
+PY
+    fi
   } > "$OUT/$base.meta"
   ls -l "$OUT/$base.fatbin"
 done

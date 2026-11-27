@@ -672,41 +672,33 @@ out of the GGUF, the picks, the gates and the report; `sn gpu gemm` / `sn bench 
  column moves 463 → 814 raw / 109 → 306 fully fused (`Docs/bench.md` §2.4, §3.7). The 70 `gemv_multi_*` fusions named
  by the Phase 4 ladder are still unimplemented and counted as pending.
 
-### Phase 6 · Caches, and the first correct GPU forward (4–6 days) — **running end-to-end on the GPU 2026-11-27, forward NOT yet correct**
+### Phase 6 · Caches, and the first correct GPU forward (4–6 days) — **CLOSED 2026-11-27: forward correct to 3e-10, golden top-1 matches the fork**
 
-*Status (2026-11-27, in progress). What exists: `sn-hip/src/cache.rs` (`KvKind` f16/q8_0/q4_0 with a
-quant-array-then-scales row — deliberately not GGML's 34 B interleaved block, for the Phase 5 Q6_K
-reason; `CacheGeom`/`CacheLayout` reserve 14 KV + 42 GDN regions per sequence from `Plan`, sizes
-asserted against §3); `kernels/phase6.hip` (`sn_row_gather_q4_k`, `sn_qk_head_norm_f32`,
-`sn_kv_append`, `sn_attn_decode_f32` — online softmax over 8-token smem K/V tiles, GQA;
-`sn_gdn_conv_silu_f32`, `sn_gdn_l2norm_f32`, `sn_gdn_decode_f32` — one workgroup per v-head, one
-state row per thread, decay→predict→write→read, no cross-lane reduce; `sn_gdn_gate_norm_f32`,
-`sn_gdn_snapshot`); an oracle twin for each in `sn-core::oracle`; `sn-hip/src/phase6.rs` +
-`sn gpu phase6`; `decode::compile_with_caches` (the per-execution cache addresses, the Q/K head norms
-the Phase 4 count never emitted, and the GDN set as real launches); `sn-hip/src/driver.rs` (`Engine`:
-one program + one captured graph per sequence, inputs through pinned memory, `step`/`generate`);
-`sn run`; `Docs/golden/expected.tsv` (the fork's top-1 and top-8 logprobs per golden prompt).
-`ProgramSpec::build()` also now emits the pinned input nodes, which it silently dropped before.*
+*Status (2026-11-27, closed). Everything the phase asked for exists: `sn-hip/src/cache.rs` (`KvKind`
+f16/q8_0/q4_0 with a quant-array-then-scales row; `CacheGeom`/`CacheLayout` reserving 14 KV + 42 GDN
+regions per sequence from `Plan`, sizes asserted against §3; `Sessions` with `check_pair`);
+`kernels/phase6.hip` (`sn_row_gather_q4_k`, `sn_qk_head_norm_f32`, `sn_kv_append`,
+`sn_attn_decode_f32`, `sn_gdn_conv_silu_f32`, `sn_gdn_l2norm_f32`, `sn_gdn_decode_f32`,
+`sn_gdn_gate_norm_f32`, `sn_gdn_snapshot`); an oracle twin for each in `sn-core::oracle`; `sn-hip/src/phase6.rs` +
+`sn gpu phase6`; `decode::compile_with_caches`; `sn-hip/src/driver.rs` (`Engine`: one program and one
+captured graph per sequence, inputs through pinned memory); `sn run`; `Docs/golden/expected.tsv`.*
 
-* **Measured:** `./Tools/build-kernels.sh && ./target/debug/sn run -m <model> --golden p1-capital -n 4 --ctx 512`
-  → 916 launches/token, **10.16 t/s in a debug build**, one graph per sequence, no per-token
-  recompile (token id, position and cache length all arrive through pinned memory).
-  `sn gpu phase6 --model <model>` → **61 kernel checks, 0 failing** (GDN set ~1e-14; attention
-  correct for f16, q8_0 and q4_0 alike).
-* **NOT met yet:** `--ref-tokens 3` → logits NMSE vs the Phase 2 reference **6.1e-1 at token 1**,
-  6.8e-1 at 2, 5.9e-1 at 3 (gate 1e-4); engine top-1 for p1-capital is 369 vs the fork's 11751.
-  The error is present at position 0, where rope is a no-op and attention over one cached row is
-  exactly that row's V — so it is an integration defect (argument wiring or state hand-off), not the
-  recurrence maths: every Phase 6 kernel passes its own oracle. Suspects to bisect: the conv-window /
-  GDN state hand-off across an execution boundary, the Q/K head-norm → rope ordering as baked, the
-  mHC seed/expose as actually executed, and the `slots.cos/sin` row addressing against the
-  `token_stride` `compile` still bakes as `dm.n_q` for q (a Phase 4 review finding).
-* Not done: the `n_seq = 2` divergent-prefix gate, `crates/sn-hip/tests/phase6.rs`, `Docs/bench.md` §4,
-  and the snapshot/prefix path exercised through a real prefill (the layout and `Sessions::check_pair`
-  are implemented and unit-tested; no forward uses a snapshot yet).
-* Fusion note: `driver::launchable_fusion()` is `RAW + norm→gemv` only. `route+merge`, RoPE-in-Q/K,
-  gate-in-`wo`, SiLU-in-`ffn_down` and `gemv_multi_*` remain pending kernels, so the Phase 7 op-count
-  target (≤ 300) needs them — 916 launches today.
+* **Gate, measured** (`./Tools/build-kernels.sh && ./target/release/sn run -m <model> --golden p1-capital -n 1 --ctx 8192 --ref-tokens 3`):
+  logits NMSE vs the Phase 2 reference **3.2e-10 / 3.2e-11 / 6.0e-11 at tokens 1/2/3** (gate 1e-4) —
+  **PASS**; engine top-1 = fork top-1 = **11751** for `p1-capital`, continuation
+  `11751 13 561 6511 314`; `sn gpu phase6` **63 kernel checks, 0 failing** (worst 6.8e-14).
+  Getting there required four silent bugs (the mHC streams must be **re-seeded at the start of every
+  loop pass**, `a = b = 0.5*(a+b)`, not once per trunk; a 7-argument launch of a 6-argument GDN
+  kernel; a folded pre-norm applied to only one of the two GEMVs that read it; a grid derived from
+  elements instead of the kernel's own indexing). The tool that found them is **`sn gpu stages`**,
+  which replays the decode program execution by execution and names the first one that leaves the
+  reference's own stage dumps — see `Docs/bench.md` §4.*
+* **Permanent guard:** `Tools/build-kernels.sh` writes `argc_<symbol>=<n>` into the image sidecar,
+  `KernelRegistry` keeps it, and `ProgramSpec::build` refuses a launch whose argument list does not
+  match the compiled kernel. HIP does not check argument counts; an extra argument is a wrong number,
+  not a fault.
+* **Not done (carried):** `n_seq=2` with divergent prefixes is only unit-tested, never run through a
+  forward; no prefill takes a GDN snapshot slot yet. Both are Phase 9's mechanism.
 
 `KVCache`: paged‑by‑block, per‑layer stride, **f16 / q8_0 / q4_0 selectable**, append‑only, positions explicit.
 `GdnState`: `[42 logical layers][n_seq][32×128×128]` f32 + conv `[8192×3]`, one contiguous slab,
@@ -718,14 +710,33 @@ naive causal attention (one workgroup per (head, tile), smem K/V tiles). Full pr
 **Gate:** logits NMSE ≤ 1e‑4 vs Phase 2 reference at token 1, 8, 64; greedy continuation identical to the fork for
 the 5 golden prompts; `n_seq=2` with divergent prefixes gives the same result as two separate runs.
 
-### Phase 7 · Decode fast path (4–6 days) — **hit the roofline**
-Assemble the Phase‑3 static program from the Phase 4/5/6 kernels for all 56 executions; bake all pointers;
-capture one `hipGraph`; move token/pos to pinned memory; drop the per‑layer `l_out` liveness to a 3‑slot ring;
-fold RoPE into the Q/K producer and the attention gate into `wo`'s epilogue; verify no host allocation and no
-`hipMemcpy`/`hipMemcpy*Async` (other than the pinned writes) inside the decode loop; `SN_TRACE` shows op count ≤ 300.
-**Gate:** ≥ **20 t/s** decode at `n_ctx=8196`, ≤ **7.0 GB** VRAM at `n_ctx=32768` with q8_0 KV, CPU < 5 %,
-and the Phase 0 launcher (`Tools/hip_count.c`) shows ≤ **2 hipLaunchKernel + 1 hipGraphLaunch per token** (the Phase 0 counter measured
-drop from ~10⁵ to ~1). **This phase is the thesis of the project; if the gate fails, stop and profile.**
+### Phase 7 · Decode fast path (4–6 days) — **profiled and half-closed 2026-11-27: 10.9 → 15.6 t/s, one graph launch and zero copies per token; ≥ 20 t/s and ≤ 300 ops NOT met**
+
+*Status. The static program, the baked pointers, the one `hipGraph` per sequence and the pinned
+token/pos/cache-length path are all in place and were already true at the end of Phase 6. What this
+phase added: the **decode profile** (`sn run --bench N`, `--drop <class>`, `--drop-match <label>`,
+`--raw`/`--fused`), `sn_argmax_f32` as the program's last node (the sampled id is written into the
+pinned slot, so the loop copies no logits), `hipDeviceScheduleBlockingSync` (decode CPU 88 % → 4.9 %
+of a core), `sn_gdn_decode_norm_f32` (the delta rule with a state row held in a lane-group's
+registers, one read and one write of the state, and the head's gated norm fused into the same
+launch), and the decision that **`norm -> gemv` is off**: it removes 112 launches and costs 10.7 ms
+per token while making the forward worse. `launchable_fusion()` is now `Fusion::RAW`.*
+
+* **Gate (all numbers in `Docs/bench.md` §5):** decode **15.6 t/s** end-to-end at `n_ctx=8192`
+  (target ≥ 20), **986 ops/token** (target ≤ 300), **0 `hipLaunchKernel` + 1 `hipGraphLaunch`** per
+  token and **no `hipMemcpy`** in the loop (targets met), **6.78 GiB / 7.28 GB** VRAM at
+  `n_ctx=32768` with q8_0 KV (met read as GiB, 0.3 GB over read as decimal), decode CPU **4.9 %**
+  (target < 5 %, at the gate), and the greedy continuation unchanged through every change.*
+* **What the profile says to do next** (this is the "stop and profile" the phase asked for): of a
+  62.9 ms token, **57.1 ms (91 %) is GEMV time for ~8.5 GB of weights = 149 GB/s**, against
+  §3.3's 190–240 GB/s microbenchmark and the 280 GB/s read reference; every elementwise kernel in
+  the program together is ~3 ms. So Phase 7b is (a) close the in-graph GEMV gap and the Q6_K row
+  (the 224-byte aligned repack §3.3 defers, worth ~7 ms), and (b) spend the `gemv_multi_*`,
+  RoPE-in-producer, gate-in-`wo` and SiLU-in-`ffn_down` kernels on the *op-count* gate, which they
+  alone can reach — not on throughput, where the fusion of an elementwise kernel is worth tenths of a
+  millisecond.
+* Not done: the ≤ 300 op count; the fused-pair kernels named above; a `Slab::clear_range` for
+  `Engine::reset`; the `n_seq=2` gate.
 
 ### Phase 8 · Prefill fast path (4–6 days)
 Chunked GDN prefill: replace the per‑token scan with the chunked/UT‑transform form (chunks of 64, matmul on

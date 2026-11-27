@@ -494,3 +494,160 @@ one shape and one geometry.
   weight multiplications are launchable, with `warps_per_row` as an argument and the grid derived
   from the same policy (asserted in `tests/phase5.rs`).
 * `sn gpu gemm`, `sn bench gemm` (`sn-cli`).
+
+---
+
+## 4. Phase 6 — the first correct GPU forward (2026-11-27)
+
+The forward runs end-to-end on the device and is **the same function as the Phase 2 CPU reference**.
+
+```
+./Tools/build-kernels.sh && ./target/release/sn run -m <model> --golden p1-capital -n 1 --ctx 8192 --ref-tokens 3
+  golden p1-capital: engine top-1 11751 vs fork top-1 11751 -> MATCH
+  logits vs Phase 2 reference at token 1: NMSE 3.157e-10 (gate 1e-4)
+  logits vs Phase 2 reference at token 2: NMSE 3.160e-11
+  logits vs Phase 2 reference at token 3: NMSE 5.961e-11
+  GATE (logits): PASS
+./target/release/sn gpu phase6 --model <model>   -> 63 checks, 0 failing (worst 6.8e-14)
+```
+
+### 4.1 `sn gpu stages`: the tool that found it
+
+`sn gpu stages --model M --golden <id> [--step N] [--deep IL]` compiles the decode program with
+nothing fused, replays it **execution by execution** (`Program::launch_range` + `ProgramSpec::exec_ends`,
+new), and compares each execution's arena slots against the Phase 2 reference's own stage dumps
+(`l_out.<il>` / `mhc.<il>.a` for the hidden state, `ffn.<il>.branch`, and with `--deep` every
+internal buffer: `gdn.<il>.z|q_t|k_t|v_t|state`, `l.<il>.h2`). It prints the first execution that
+leaves the reference. Without it, "the forward is wrong" is one number on 248 320 logits; with it, it
+is a line number.
+
+### 4.2 Four silent bugs, all found by bisecting (worst first)
+
+| # | bug | tell | class |
+|---|---|---|---|
+| 1 | **The mHC streams are re-seeded at the start of every loop pass, not once per trunk.** `forward.rs` seeds `a = b = cur` whenever `physical == mhc.start` — logical 4 *and* logical 28 — and `cur` there is the `0.5*(a+b)` the previous pass exposed. The engine seeded once, so pass 2 continued pass 1's streams. | every execution of pass 1 matched to 1e-11; execution 28 (block 4, second visit) jumped to 3.2e-2 and the error then *diluted* (1e-2 → 1e-3) as the streams grew | a missing op, so nothing faults |
+| 2 | **`sn_gdn_gate_norm_f32` was launched with 7 arguments for a 6-argument kernel.** `n_v_heads` was passed where the kernel reads `d_v`, so `d_v = 32` and `eps = 128`-as-float-bits. | GDN state correct to 7e-14, `gdn.<il>.branch` wrong by 4.3e-1 — the recurrence was fine, its consumer was not | ABI; HIP never checks argument counts |
+| 3 | **`ssm_beta_alpha` lost its pre-norm when `norm -> gemv` was on.** The fold means no buffer holds the normalised vector, so *every* GEMV that reads one has to fold it; only the first did. | `--raw` (nothing fused) matched the reference at 3e-12 while the folded program was 6.8e-3 off at token 3 | a fusion applied to one consumer of two |
+| 4 | `sn_gdn_gate_norm_f32` was also launched with `grid1d(n_v_heads*d_v)` = 16 workgroups for a kernel that indexes `base = blockIdx.x * d_v` — it covered half the heads. | same row as #2 once the arguments were right | grid derived from elements, not from the kernel's own indexing |
+
+**New permanent guard against #2.** `Tools/build-kernels.sh` now writes `argc_<symbol>=<n>` into every
+`.meta` (parsed from the `__global__` signatures), `KernelRegistry` keeps it, and
+`ProgramSpec::build` refuses to build a program whose argument list does not match the compiled
+kernel. The whole class is now a build-time error instead of a plausible wrong number.
+
+### 4.3 Not met in Phase 6
+
+`n_seq = 2` with divergent prefixes is still only unit-tested (`cache::Sessions::check_pair`), never
+run through a forward; the GDN snapshot slots exist in the layout and the kernel but no prefill takes
+one yet. Both are Phase 9's mechanism and are listed as open in the design plan.
+
+---
+
+## 5. Phase 7 — the decode fast path: profile first (2026-11-27)
+
+Phase 7's instruction is "if the gate fails, stop and profile". The gate (≥ 20 t/s at `n_ctx=8196`,
+≤ 300 ops/token) failed at 916 launches and 10.9 t/s, so it was profiled, and the profile changed
+what this phase builds.
+
+### 5.1 The measurement tool
+
+`sn run ... --bench N` replays the captured graph N times with device events and nothing else in the
+loop; `--drop <classes>` and `--drop-match <label-substring>` build the same program *without* those
+ops, so the difference is what that class or that weight costs. `--raw` / `--fused` pick the fusion
+preset. No profiler, no rebuild, one command.
+
+### 5.2 A decode step, before and after
+
+`./target/release/sn run -m <model> --golden p1-capital -n 0 --ctx 8192 --bench 30 [--drop …]`
+
+| program | ms/token | t/s |
+|---|---|---|
+| 918 launches, everything unfused except `norm -> gemv` (Phase 6 default) | 91.7 | 10.9 |
+| same, `--raw` (nothing folded) | 81.0 | 12.3 |
+| same, GDN delta rule rewritten (§5.4) | **62.9** | **15.9** |
+
+What the 91.7 ms was made of (differences against the first row):
+
+| removed | cost it was |
+|---|---|
+| every GEMV (351 launches, ~8.5 GB of weights) | 69.2 ms |
+| the GDN delta rule (`gdn step`, 42 launches) | **17.8 ms** |
+| every route + merge (194 launches) | 2.3 ms |
+| silu + gate + rope + norm + add + input (290 launches) | 0.8 ms |
+| `sn_gdn_gate_norm_f32` alone (42) | 1.4 ms |
+| `sn_gdn_l2norm_f32` alone (42) | 1.6 ms |
+| `kv_append` alone (14) | ~2 ms (inside the noise) |
+
+**The conclusion the plan did not expect:** the elementwise fusions of §6 P2 are worth ~3 ms of 92,
+while the *launch count* they save is 480 nodes. Two of them are actively harmful:
+
+* `norm -> gemv` **costs 10.7 ms** (it removes 112 launches). Each folded GEMV re-runs the
+  4 096-element reduction the previous one already did — 84 reductions per token where one rmsnorm
+  kernel per execution costs ~2 ms — and it is numerically worse (§4.2 #3). **`launchable_fusion()`
+  is now `Fusion::RAW`.** Fusions are decided by measurement here, not by the list.
+* The GDN gated norm fold and the conv/L2 pair are worth it because they remove a **round trip
+  through memory** (4 096 floats per execution) and a latency-bound launch, not just a node.
+
+### 5.3 The current decode step
+
+`./target/release/sn run -m <model> --golden p1-capital -n 1 --ctx 8192`
+
+```
+program: 986 ops per token (989 launches = 3 pinned copies + 986 kernels)
+  gemv 351  recur 112  merge 98  silu 98  route 96  rope 28  norm 15  add 16  gate 14  input 1  sample 1
+```
+
+**The ≤ 300 target is NOT met** (986). The arithmetic of why: 56 executions × (2 route+merge + 1
+branch producer + 1 branch consumer + 2 FFN) is already 336 before the recurrent inner kernels, the
+QK norms, the KV append, the rope table, the residual adds outside the mHC range, the input staging
+and the head. Reaching it needs the `gemv_multi_*` pairs, RoPE in the Q/K producer, the attention
+gate in `wo`'s epilogue and SiLU in `ffn_down`'s prologue — all of which are *launch-count* wins
+worth ~3 ms of device time at the current GEMV rates, and all of which are pending kernels, not
+missing plans. They are named and counted (`sn hip ops --ladder`), and Phase 7b has them.
+
+### 5.4 The one kernel rewrite that paid: the Gated DeltaNet decode
+
+`sn_gdn_decode_f32` (Phase 6) is a line-by-line transcription of §2.4: one thread per state row,
+`d_v` threads per workgroup. It is correct to 1e-14 and cost **17.8 ms of a 92 ms token**. Dividing
+out the traffic — 42 executions × 2.1 MB of f32 state read and written = 176 MB — says it should
+have cost ~1 ms: it was moving 10 GB/s. It was latency-bound (4 096 threads per launch on 16 CUs,
+three dependent passes over the state) rather than bandwidth-bound.
+
+`sn_gdn_decode_norm_f32` (same image, 4 lanes per state row, 512 threads per v-head) keeps a row in
+the registers of its lanes, reads the state **once** and writes it once, reduces the two row-wide dot
+products with a 4-lane `__shfl_xor_sync` butterfly (width-confined, so every lane named by the mask
+is live — a mask naming an inactive lane hangs gfx1102), and finishes the head's gated norm in shared
+memory in the same launch. The separate `sn_gdn_gate_norm_f32` launch and its round trip through
+`gdn_core` are gone: −42 launches, and the element stays in the workgroup that computed it.
+
+| | before | after |
+|---|---|---|
+| GDN decode, per token (42 executions) | 17.8 ms | **1.85 ms** |
+| state traffic | 3 reads + 2 writes of 176 MB | 1 read + 1 write |
+| correctness | 1.5e-14 vs oracle | `gdn_decode_norm state/out` 6.5e-14 / 6.8e-14, forward still 3e-10 vs the reference |
+
+That is 9.6×, and it is why the token went 81 ms → 63 ms. The GEMVs are now 91 % of the remaining
+63 ms (57.1 ms for ~8.5 GB = 149 GB/s against the 280 GB/s `sn_read_bw` reference): §3.3's Q6_K row
+(101–114 GB/s, the 210-byte super-block alignment) and the gap between the microbenchmark's
+190–240 GB/s and the 149 GB/s achieved inside a 986-node graph are the two things left.
+
+### 5.5 Gate results, Phase 7
+
+| gate | target | measured | verdict |
+|---|---|---|---|
+| decode throughput at `n_ctx=8196` | ≥ 20 t/s | **15.6 t/s** end-to-end (`-n 128 --ctx 8192`: 133 steps in 8.53 s); 15.9 t/s in graph-only `--bench` | **NOT MET** (from 5 t/s in the fork, and 10.9 at the start of this phase) |
+| ops per decoded token | ≤ 300 | 986 | **NOT MET**, see §5.3 |
+| launches per token | ≤ 2 `hipLaunchKernel` + 1 `hipGraphLaunch` | **0 + 1** — the token id, the position, the cache lengths and now the sampled id all cross through one pinned page; the loop is `stage → hipGraphLaunch → sync` | **MET** (structural; asserted by the driver's `step`/`generate` having no other path) |
+| no `hipMemcpy` / host allocation in the loop | 0 | 0 — the 993 KB logits copy that sampling used is gone: `sn_argmax_f32` is the program's last node and writes the sampled id into the pinned slot (§5.6) | **MET** |
+| VRAM at `n_ctx=32768`, q8_0 KV | ≤ 7.0 GB | **6.78 GiB = 7.28 GB decimal** in use (5.41 GiB weights + 1.16 GiB cache arena + activations), 1.21 GiB free | **met read as GiB, 0.3 GB over read as decimal GB** — reported both ways |
+| decode CPU | < 5 % | **4.9 % of a core** (Δ between `-n 64` and `-n 320`: Δreal 17.0 s, Δuser 0.41 s + Δsys 0.42 s). Without `hipDeviceScheduleBlockingSync` it is 88 % — that CPU is the runtime's spin-wait, not engine work: the engine's per-token host work is a 12-byte pinned write, one graph launch, and reading 4 bytes | **MET, at the gate** |
+| correctness preserved through the fast path | greedy output unchanged | `p1-capital` continuation `11751 13 561 6511 314` before and after every Phase 7 change; logits NMSE vs the reference 3e-10 | **MET** |
+
+### 5.6 Sampling moved into the program
+
+`sn_argmax_f32` (one workgroup, fixed-order block reduce, ties to the lowest index) is the last node
+of the program and writes the sampled **id** into `decode::PIN_SAMPLE` — host-pinned memory the
+device writes directly. `Engine::sampled()` reads four bytes after the sync. That removes a 993 KB
+`hipMemcpy` and a 248 320-element CPU pass from every decoded token, which is what made the CPU
+number above measurable at all. `Engine::logits()` (the copy) is still there, used only by
+`--ref-tokens` and `sn gpu stages`.

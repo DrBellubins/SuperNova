@@ -94,6 +94,243 @@ pub fn cmd_route(positional: &[String], opt_val: &dyn Fn(&str) -> Option<String>
     Ok(out)
 }
 
+/// Read one Phase 2 stage dump (`forward.rs`'s text format: a `# stage …` header, then one value
+/// per line).
+fn read_stage(dir: &std::path::Path, stage: &str) -> Option<Vec<f32>> {
+    let text = std::fs::read_to_string(dir.join(format!("{stage}.txt"))).ok()?;
+    let mut v = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        v.push(l.parse::<f32>().ok()?);
+    }
+    Some(v)
+}
+
+/// The worst element-wise difference, for a failing stage (NMSE alone hides whether one value is
+/// wrong or all of them are slightly wrong).
+fn worst_diff(a: &[f32], b: &[f32]) -> (usize, f32, f32) {
+    let mut w = 0usize;
+    let mut wd = 0.0f32;
+    for i in 0..a.len().min(b.len()) {
+        let d = (a[i] - b[i]).abs();
+        if d > wd {
+            wd = d;
+            w = i;
+        }
+    }
+    (w, a[w], b[w])
+}
+
+/// `sn gpu stages`: replay the decode program execution by execution and compare the arena with the
+/// Phase 2 reference's own stage dumps. This is the bisect for "the forward is wrong": it names the
+/// first execution whose output leaves the reference, instead of reporting one NMSE on the logits.
+///
+/// It compiles the program with `Fusion::RAW` on purpose: every step of §2 is then a separate
+/// launch writing a separate buffer, so there is something to read back at every boundary.
+pub fn cmd_stages(positional: &[String], opt_val: &dyn Fn(&str) -> Option<String>) -> Result<String> {
+    use sn_core::forward::{Dumper, RefModel};
+    use sn_hip::decode::Fusion as Fus;
+    use sn_hip::driver::{Engine, EngineCfg};
+
+    let model = opt_val("--model")
+        .or_else(|| positional.get(2).cloned())
+        .ok_or_else(|| sn_core::Error::msg("sn gpu stages --model <gguf> --golden <id> [--step 1]"))?;
+    let gid = opt_val("--golden").ok_or_else(|| sn_core::Error::msg("stages needs --golden <id> (a tokenised golden prompt)"))?;
+    let step = opt_val("--step").and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
+    // `--deep N`: stop after execution N and compare every internal buffer that execution writes.
+    let deep: Option<usize> = opt_val("--deep").and_then(|v| v.parse().ok());
+    let g = Gguf::open(&model)?;
+    let plan = Plan::build(Hyperparams::from_gguf(&g)?)?;
+    let e = crate::run::read_expected(&opt_val("--expected").unwrap_or("Docs/golden/expected.tsv".into()), &gid)?;
+    let prompt = e.prompt.clone();
+    let ntok = step.min(prompt.len());
+
+    // 1. the reference, over the same tokens, with every stage dumped.
+    let dir = std::env::temp_dir().join(format!("sn-stages-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let allow: Vec<String> = ["embd", "l.", "l_out.", "gdn.", "attn.", "ffn.", "mhc.", "logits", "final_norm"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let mut rm = RefModel::new(&plan, &g)?;
+    rm.set_kv_f16(true);
+    rm.set_threads(8);
+    let rl = rm.run(&prompt[..ntok], None, &Dumper::with_filter(Some(dir.clone()), &allow)?)?;
+
+    // 2. the engine, same tokens, nothing fused, one execution at a time.
+    let cfg = EngineCfg {
+        n_ctx: (ntok + 8).next_power_of_two(),
+        n_seq: 1,
+        n_snap: 0,
+        kv: sn_hip::cache::KvKind::F16,
+        fusion: Fus::RAW,
+        ..Default::default()
+    };
+    let mut eng = Engine::open(&g, &plan, &cfg)?;
+    // Everything the loop needs from the compiled program, taken before the loop borrows `eng`
+    // mutably: the execution boundaries, the label of each boundary's last op, and the op count.
+    let ends: Vec<(usize, usize, String)> = {
+        let spec = eng.program(0);
+        spec.exec_ends
+            .iter()
+            .map(|&(il, end)| (il, end, spec.ops[end.saturating_sub(1)].label.clone()))
+            .collect()
+    };
+    let nsched = eng.program(0).len();
+    let nops = eng.ops_for(0);
+    // `ProgramSpec::build` prepends the pinned-input copies, so a `spec.exec_ends` index is an index
+    // into `spec.ops`, and the program the driver holds has `inputs.len()` nodes in front of it.
+    let ibase = eng.program(0).inputs.len();
+    let slots = eng.slots().clone();
+    let n = plan.hp.n_embd;
+    eng.stage(0, prompt[0], 0)?;
+
+    let mut out = format!("{}\nmodel: {model}\ngolden {gid}: comparing {} engine execution(s) against the Phase 2 reference at token {ntok}\n", sub_info(&eng), nops);
+    out += &format!("reference stage dumps: {}\n\n", dir.display());
+    out += &format!("program: {} scheduled nodes = {} launches; spec: {} ops + {} pinned copies; last execution ends at spec op {}\n", nops, eng.ops_for(0), nsched, ibase, ends.last().map(|e| e.1).unwrap_or(0));
+    out += "  il blk kind  hidden a/b or cur         ffn branch            last op\n";
+    let mut prev = 0usize;
+    let mut first_bad: Option<usize> = None;
+    for entry in &ends {
+        let il = entry.0;
+        let end = entry.1;
+        let last = &entry.2;
+        // The first range starts at 0 so the pinned-input nodes run once; after that only the
+        // execution's own ops are added to the stream.
+        eng.launch_ops(0, if prev == 0 { 0 } else { prev + ibase }, (end + ibase).min(nops))?;
+        prev = end;
+        let ex = *plan.exec(il);
+        let kind = if ex.mtp != 0 { "mtp" } else if ex.recurrent { "gdn" } else { "attn" };
+        // Inside the mHC range the state of the trunk is the two streams; outside it, `cur`.
+        let (stage, got) = if ex.mhc {
+            (format!("mhc.{il}.a"), eng.read_f32(slots.a, n)?)
+        } else {
+            (format!("l_out.{il}"), eng.read_f32(slots.cur, n)?)
+        };
+        let want = read_stage(&dir, &stage);
+        let (hn, hd) = match &want {
+            Some(w) => (sn_core::oracle::nmse(&got, w), worst_diff(&got, w)),
+            None => (f64::NAN, (0, 0.0, 0.0)),
+        };
+        let bn = if ex.mtp != 0 { "-".to_string() } else {
+            // At the boundary the `branch` slot holds the FFN's output (every branch shares it).
+            let stage = format!("ffn.{il}.branch");
+            let got = eng.read_f32(slots.branch, n)?;
+            match read_stage(&dir, &stage) {
+                Some(w) => format!("{:>9.3e}", sn_core::oracle::nmse(&got, &w)),
+                None => "     n/a".to_string(),
+            }
+        };
+        if hn > 1e-3 && first_bad.is_none() {
+            first_bad = Some(il);
+        }
+        out += &format!(
+            "{:>4} {:>3} {:<5} {:>9.3e} {:>7} {:>9} {}\n",
+            il,
+            ex.tensor_block,
+            kind,
+            hn,
+            if want.is_some() { "" } else { "MISSING" },
+            bn,
+            last,
+        );
+        if want.is_none() {
+            out += &format!("       (no {} in the dump)\n", stage);
+        } else if hn > 1e-3 {
+            out += &format!("       worst element index {w}, engine {eg}, reference {rf} (reference stage {stage})\n", w = hd.0, eg = hd.1, rf = hd.2);
+        }
+        if deep == Some(il) {
+            out += &format!("\ndeep comparison for execution {il} (block {})\n", plan.exec(il).tensor_block);
+            out += &stage_deep(&mut eng, &plan, &dir, il, &slots)?;
+            break;
+        }
+    }
+    // The head: the ops after the last execution (final norm + output projection).
+    eng.launch_ops(0, (prev + ibase).min(nops), nops)?;
+    let got = eng.read_f32(slots.head, plan.hp.vocab)?;
+    let nm = sn_core::oracle::nmse(&got, &rl);
+    out += &format!(
+        "\nlogits: NMSE {nm:.3e}  engine top-1 {}  reference top-1 {}  fork top-1 {}\n",
+        sn_hip::driver::argmax_of(&got),
+        sn_hip::driver::argmax_of(&rl),
+        e.top1
+    );
+    // The stage dumps are hundreds of MB (the GDN state is 0.5 M values per execution); they are a
+    // scratch artifact, not an output of the command.
+    let _ = std::fs::remove_dir_all(&dir);
+    match first_bad {
+        Some(il) => out += &format!("\nfirst execution that leaves the reference: {il} (block {})\n", plan.exec(il).tensor_block),
+        None => out += "\nno execution diverged beyond 1e-3\n",
+    }
+    Ok(out)
+}
+
+fn sub_info(eng: &sn_hip::driver::Engine) -> String {
+    eng.substrate().dev.info.to_string()
+}
+
+/// Every internal buffer one execution writes, against the reference's stage dump for it. This is
+/// the level where a wrong GDN argument order (q vs k, tap order in the conv, the z offset) shows
+/// up as one line instead of as "the logits are wrong".
+fn stage_deep(
+    eng: &mut sn_hip::driver::Engine,
+    plan: &Plan,
+    dir: &std::path::Path,
+    il: usize,
+    slots: &sn_hip::decode::Slots,
+) -> Result<String> {
+    let dm = &plan.hp.dims;
+    let n = plan.hp.n_embd;
+    let ex = *plan.exec(il);
+    let mut out = String::new();
+    let cmp = |s: &mut String, stage: &str, got: &[f32]| {
+        match read_stage(dir, stage) {
+            Some(w) => {
+                let nm = sn_core::oracle::nmse(got, &w);
+                let wd = worst_diff(got, &w);
+                *s += &format!(
+                    "  {:<18} NMSE {:>9.3e}  worst idx {:>5}  engine {:>13.6}  reference {:>13.6}\n",
+                    stage, nm, wd.0, wd.1, wd.2
+                );
+            }
+            None => *s += &format!("  {:<18} (not dumped)\n", stage),
+        }
+    };
+    let h = eng.read_f32(slots.h, n)?;
+    // Whichever `h` the execution leaves in the slot: outside the mHC range that is the
+    // post-attention norm (`l.<il>.h2`), because the same slot is reused for both halves.
+    cmp(&mut out, &format!("l.{il}.h2"), &h);
+    cmp(&mut out, &format!("l.{il}.h"), &h);
+    if ex.recurrent {
+        let z = eng.read_f32(slots.qkvz + dm.qkv_width * 4, dm.n_v_heads * dm.d_v)?;
+        cmp(&mut out, &format!("gdn.{il}.z"), &z);
+        let conv = eng.read_f32(slots.conv_out, dm.qkv_width)?;
+        let qk = dm.n_k_heads * dm.d_k;
+        cmp(&mut out, &format!("gdn.{il}.q_t"), &conv[..qk]);
+        cmp(&mut out, &format!("gdn.{il}.k_t"), &conv[qk..2 * qk]);
+        cmp(&mut out, &format!("gdn.{il}.v_t"), &conv[2 * qk..]);
+        let (st, _) = eng.gdn_regions(il, 0)?;
+        let state = eng.read_cache_f32(st, dm.n_v_heads * dm.d_v * dm.d_k)?;
+        cmp(&mut out, &format!("gdn.{il}.state"), &state);
+        let br = eng.read_f32(slots.branch, n)?;
+        cmp(&mut out, &format!("gdn.{il}.branch"), &br);
+    } else {
+        let ao = eng.read_f32(slots.attn_out, dm.n_q)?;
+        cmp(&mut out, &format!("attn.{il}.out"), &ao);
+        let br = eng.read_f32(slots.branch, n)?;
+        cmp(&mut out, &format!("attn.{il}.branch"), &br);
+    }
+    // `branch` is the slot every branch writes, so at the boundary it holds the FFN's output.
+    let br = eng.read_f32(slots.branch, n)?;
+    cmp(&mut out, &format!("ffn.{il}.branch"), &br);
+    let cur = eng.read_f32(slots.cur, n)?;
+    cmp(&mut out, &format!("l_out.{il}"), &cur);
+    Ok(out)
+}
+
 /// `sn gpu gemm` / `sn bench gemm`: the Phase 5 matmul surface.
 ///
 /// One command does both halves because they share the only expensive setup - copying the

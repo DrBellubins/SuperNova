@@ -51,6 +51,7 @@ pub fn read_expected(path: &str, id: &str) -> Result<Expected> {
 }
 
 pub fn cmd_run(positional: &[String], opt_val: &dyn Fn(&str) -> Option<String>) -> Result<String> {
+    let flag = |n: &str| positional.iter().any(|a| a == n) || std::env::args().any(|a| a == n);
     // `--golden p1-capital` puts the golden id in `positional` too, so a positional model path is
     // only accepted if it is not that id.
     let golden = opt_val("--golden").or_else(|| opt_val("--expect"));
@@ -90,7 +91,26 @@ pub fn cmd_run(positional: &[String], opt_val: &dyn Fn(&str) -> Option<String>) 
     let n_seq: usize = opt_val("--seq").unwrap_or("1".into()).parse().unwrap_or(1);
     let n_snap: usize = opt_val("--snap").unwrap_or("1".into()).parse().unwrap_or(1);
     let kv = match opt_val("--kv") { Some(v) => KvKind::parse(&v)?, None => KvKind::F16 };
-    let cfg = EngineCfg { n_ctx, n_seq, n_snap, kv };
+    // `--raw` compiles the program with nothing fused: every step of §2 is a separate launch. It
+    // exists to answer "is this difference the fusion or the maths?" without rebuilding anything.
+    let fusion = if flag("--raw") {
+        sn_hip::decode::Fusion::RAW
+    } else if flag("--fused") {
+        sn_hip::decode::Fusion::FUSED
+    } else {
+        sn_hip::driver::launchable_fusion()
+    };
+    let cfg = EngineCfg {
+        n_ctx,
+        n_seq,
+        n_snap,
+        kv,
+        fusion,
+        drop_classes: opt_val("--drop")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default(),
+        drop_match: opt_val("--drop-match"),
+    };
 
     let t0 = std::time::Instant::now();
     let mut eng = Engine::open(&g, &plan, &cfg)?;
@@ -108,6 +128,15 @@ pub fn cmd_run(positional: &[String], opt_val: &dyn Fn(&str) -> Option<String>) 
         open_secs
     );
     out += &eng.cache_report();
+    // Phase 7's VRAM half of the gate is a number about the *device*, not about the layout: what is
+    // actually left after the weight slab and both arenas are allocated.
+    let (free, total) = eng.substrate().free_device_memory()?;
+    out += &format!(
+        "vram: {} of {} device memory in use (weights + arenas), {} free\n",
+        sn_hip::human(total - free),
+        sn_hip::human(total),
+        sn_hip::human(free)
+    );
     let spec = eng.program(0);
     out += &format!(
         "program: {} ops per token ({} launches), {} ops including pinned copies\n",
@@ -141,6 +170,26 @@ pub fn cmd_run(positional: &[String], opt_val: &dyn Fn(&str) -> Option<String>) 
     out += &format!("\ncaches after the run:\n{}", eng.sessions_mut().report());
 
     // ---- the gate halves ----------------------------------------------------------------
+    // `--bench N`: N graph replays with device events and nothing else in the loop. This is the
+    // Phase 7 number (t/s at a given n_ctx); with `--drop <class>` the difference between two runs
+    // is what that class costs, which is the no-profiler version of "stop and profile".
+    if let Some(n) = opt_val("--bench").and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0) {
+        let ms = eng.bench_replay(0, n)?;
+        out += &format!(
+            "\nbench: {} replays of a {}-launch program in {:.1} ms = {:.3} ms/token = {:.2} t/s{}\n",
+            n,
+            eng.ops_for(0),
+            ms,
+            ms / n as f64,
+            n as f64 / (ms / 1e3),
+            if cfg.drop_classes.is_empty() {
+                String::new()
+            } else {
+                format!(" (classes dropped: {:?})", cfg.drop_classes)
+            }
+        );
+    }
+
     if let Some(e) = &expect {
         let got = sampled[0];
         let ok = got == e.top1;

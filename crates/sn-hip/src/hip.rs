@@ -171,6 +171,7 @@ declare_api! {
     hipDeviceTotalMemV2: (*mut usize, HipDevice) -> HipError,
     hipMemGetInfo: (*mut usize, *mut usize) -> HipError,
     hipDeviceSynchronize: () -> HipError,
+    hipSetDeviceFlags: (u32) -> HipError,
     hipGetErrorName: (HipError) -> *const c_char,
     hipGetErrorString: (HipError) -> *const c_char,
 

@@ -191,7 +191,16 @@ impl Program {
     /// Launch every op in order on `stream`, no graph. This is the `--no-graph` debug path and the
     /// baseline the graph gate is measured against.
     pub fn launch(&self, dev: &Device, stream: HipStream) -> Result<()> {
-        for op in &self.ops {
+        self.launch_range(dev, stream, 0, self.ops.len())
+    }
+
+    /// Launch ops `from..to` in order. The debug path for "which part of the program is wrong (or
+    /// slow)": `sn gpu stages` stops after each execution and reads the arena back, and a range
+    /// timed with events gives a per-section cost without a profiler.
+    pub fn launch_range(&self, dev: &Device, stream: HipStream, from: usize, to: usize) -> Result<()> {
+        let a = from.min(self.ops.len());
+        let b = to.min(self.ops.len()).max(a);
+        for op in self.ops[a..b].iter() {
             match &op.kind {
                 OpKind::Kernel { func, grid, block, shared, argv, .. } => {
                     let mut params = argv.params();

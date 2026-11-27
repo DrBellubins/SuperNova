@@ -218,6 +218,20 @@ impl Substrate {
     /// Open the device and create the stream. Never panics without a GPU - it returns an error, so
     /// `sn` keeps working on a machine with no ROCm.
     pub fn open() -> Result<Substrate> {
+        // Sleep instead of spin inside `hipStreamSynchronize` (design-plan §0 "decode CPU < 1 %").
+        // The decode loop's *engine* work is a 12-byte pinned write and one graph launch; the CPU it
+        // shows is the runtime's spin-wait for the 60 ms of GPU work it is waiting on. With the
+        // default schedule that is ~90 % of a core doing nothing useful (`Docs/bench.md` §5.4); with
+        // `hipDeviceScheduleBlockingSync` the thread blocks. `SN_SPIN=1` keeps the spinning behaviour
+        // for the micro-benchmarks, where a spin is what makes a 3 us measurement trustworthy.
+        if std::env::var("SN_SPIN").is_err() {
+            let api = crate::hip::HipApi::load();
+            if let Some(f) = api.hipSetDeviceFlags {
+                // hipDeviceScheduleBlockingSync. An error here is not fatal: the worst case is the
+                // old spinning behaviour.
+                let _ = f(4u32);
+            }
+        }
         let dev = Device::open()?;
         let mut stream: *mut c_void = std::ptr::null_mut();
         check("hipStreamCreate", dev.api.hipStreamCreate.unwrap()(&mut stream), &dev.api)?;

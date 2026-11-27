@@ -30,24 +30,22 @@ use crate::phase6;
 use crate::program::{Graph, Program, ProgramBuilder};
 use crate::{human, Substrate};
 
-/// The fusion preset this phase can actually launch. Of the six §6 P2 fusions, two are implemented
-/// (`norm -> gemv`, and `route + merge` *as two kernels*): the rest need kernels Phase 6 has not
-/// written (`sn_mhc_merge_route_f32`, RoPE in the Q/K producer, the attention gate in `wo`,
-/// SiLU-mul in `ffn_down`, and the `gemv_multi_*` pairs — the last two are named pending in the
-/// Phase 5 record, `Docs/bench.md` §3.7). `Engine::open` refuses a program with any pending launch,
-/// so this is the honest set rather than an aspiration.
+/// The fusion preset this engine runs by default: **nothing folded**.
+///
+/// This used to be `FUSED.without(everything except norm -> gemv)`, i.e. the pre-norm folded into
+/// the GEMVs that read it. Measured on this card (`sn run --bench 30 --ctx 8192`, `Docs/bench.md`
+/// §5.1), the fold is a net *loss*: it removes 112 launches and costs 10.7 ms per token, because
+/// every folded GEMV re-runs the 4 096-element reduction the other one already did (42 executions x
+/// 2 GEMVs), while the separate `sn_rmsnorm_f32` launches are worth ~2 ms in total. It also made
+/// the forward numerically worse: `norm -> gemv` was 6.8e-3 off the Phase 2 reference at token 3
+/// while the unfolded program is 6e-11 off (and the fold has to be repeated for every consumer of
+/// the same normalised vector, which is how `ssm_beta_alpha` lost its norm for a day).
+///
+/// The fusions that pay are the ones that remove a *round trip through memory* or a latency-bound
+/// launch (the GDN decode + gated norm, the conv + L2 norm, RoPE in the Q/K producer), not the ones
+/// that only remove a node. Each is decided by measurement here, not by the §6 P2 list.
 pub fn launchable_fusion() -> Fusion {
-    let mut f = Fusion::FUSED;
-    for flag in [
-        decode::FusionFlag::RouteMerge,
-        decode::FusionFlag::Silu,
-        decode::FusionFlag::Rope,
-        decode::FusionFlag::Gate,
-        decode::FusionFlag::Multi,
-    ] {
-        f = f.without(flag);
-    }
-    f
+    Fusion::RAW
 }
 
 /// What to size the engine for.
@@ -59,11 +57,30 @@ pub struct EngineCfg {
     /// GDN snapshot slots per sequence (0 disables snapshots).
     pub n_snap: usize,
     pub kv: KvKind,
+    /// Which §6 P2 fusions the compiled program uses. `launchable_fusion()` is the default; the
+    /// stage bisect compiles `Fusion::RAW` so every intermediate of §2 is a real buffer to read.
+    pub fusion: Fusion,
+    /// Op *classes* to leave out of the built program. Timing a program with a class removed is the
+    /// no-profiler answer to "where does a decode step go" (`sn run --drop gemv`), and it is only
+    /// ever a measurement tool: a program with a class dropped computes wrong values by construction.
+    pub drop_classes: Vec<String>,
+    /// Drop ops whose *label* contains this text (e.g. "gemv output head", "ffn_down"). Same tool
+    /// as `drop_classes` but at tensor granularity: the per-weight cost of a decode step, without a
+    /// profiler.
+    pub drop_match: Option<String>,
 }
 
 impl Default for EngineCfg {
     fn default() -> EngineCfg {
-        EngineCfg { n_ctx: 4096, n_seq: 1, n_snap: 1, kv: KvKind::F16 }
+        EngineCfg {
+            n_ctx: 4096,
+            n_seq: 1,
+            n_snap: 1,
+            kv: KvKind::F16,
+            fusion: launchable_fusion(),
+            drop_classes: Vec::new(),
+            drop_match: None,
+        }
     }
 }
 
@@ -169,7 +186,7 @@ impl Engine {
         let mut seqs = Vec::new();
         for seq in 0..cfg.n_seq {
             let args = CacheArgs { layout: &cache_layout, seq, kind: cfg.kv };
-            let spec = decode::compile_with_caches(plan, &slots, bases, layout.activations.total(), launchable_fusion(), &resolve, &args)?;
+            let spec = decode::compile_with_caches(plan, &slots, bases, layout.activations.total(), cfg.fusion, &resolve, &args)?;
             if spec.pending() != 0 {
                 let mut names: Vec<&str> = spec.ops.iter().filter(|o| o.pending).map(|o| o.kernel.as_str()).collect();
                 names.sort();
@@ -182,7 +199,27 @@ impl Engine {
             }
             let stream = sub.new_stream()?;
             let mut b = ProgramBuilder::new(&sub.dev);
-            let n = spec.build(&reg, &mut b, true)?;
+            // `spec.build` appends every op; the drop list is applied by rebuilding without them.
+            // A `&[String]` filter is deliberately in the driver and not in the compiler: the count
+            // the report shows must stay the true one.
+            let drop = |o: &crate::decode::OpSpec| -> bool {
+                cfg.drop_classes.iter().any(|c| c == o.class)
+                    || cfg.drop_match.as_deref().is_some_and(|m| o.label.contains(m))
+            };
+            if !cfg.drop_classes.is_empty() || cfg.drop_match.is_some() {
+                let spec2 = ProgramSpec {
+                    ops: spec.ops.iter().filter(|o| !drop(o)).cloned().collect(),
+                    inputs: spec.inputs.clone(),
+                    fusion: spec.fusion,
+                    arena_bytes: spec.arena_bytes,
+                    exec_ends: Vec::new(),
+                };
+                let n = spec2.build(&reg, &mut b, false)?;
+                let _ = n;
+            } else {
+                let n = spec.build(&reg, &mut b, true)?;
+                let _ = n;
+            }
             let program = b.finish();
             // Warm up once outside capture (the first launch of a module loads code), then capture.
             if std::env::var("SN_DEBUG_OPS").is_ok() {
@@ -215,7 +252,6 @@ impl Engine {
             let graph = Graph::capture(&sub.dev, stream, &program)?;
             sub.destroy_stream(stream);
             seqs.push(SeqProgram { spec, program, graph });
-            let _ = n;
         }
 
         // Undo the warm-up's effect on the caches: every sequence starts empty.
@@ -262,7 +298,7 @@ impl Engine {
 
     /// Stage one step into pinned memory: the token id, the position, and the meta rows. This is
     /// the only host write a decode step makes.
-    fn stage(&mut self, seq: usize, token: u32, pos: u32) -> Result<()> {
+    pub fn stage(&mut self, seq: usize, token: u32, pos: u32) -> Result<()> {
         self.sessions.append(seq, pos)?;
         let pinned = self.sub.io_mut().ok_or_else(|| Error::msg("no pinned input slot"))?;
         let bytes = pinned.as_mut_bytes();
@@ -281,15 +317,80 @@ impl Engine {
         self.sub.sync()
     }
 
+    /// Time `steps` graph replays with device events. Nothing else is in the loop: no staging, no
+    /// read-back, no sampling. This is the number the Phase 7 gate is written in (t/s at a given
+    /// `n_ctx`), and the difference between two of them (`--drop <class>`) is the per-class cost.
+    pub fn bench_replay(&mut self, seq: usize, steps: usize) -> Result<f64> {
+        let t = crate::program::Timer::new(&self.sub.dev)?;
+        // One warm-up replay so the modules and the graph are resident, then the measured run.
+        self.seqs[seq].graph.replay(&self.sub.dev, self.sub.stream)?;
+        self.sub.sync()?;
+        t.begin(&self.sub.dev, self.sub.stream)?;
+        for _ in 0..steps {
+            self.seqs[seq].graph.replay(&self.sub.dev, self.sub.stream)?;
+        }
+        let ms = t.end_ms(&self.sub.dev, self.sub.stream)?;
+        self.sub.sync()?;
+        Ok(ms)
+    }
+
     /// The logits the last step left in the arena.
     pub fn logits(&self) -> Result<Vec<f32>> {
         let n = self.vocab;
-        let raw = self.sub.activations()?.read(&self.dev_api(), self.slots.head, n * 4)?;
+        self.read_f32(self.slots.head, n)
+    }
+
+    /// Read `n` f32 activations back from the arena. Debug/bisect only — nothing in a decode loop
+    /// calls this.
+    pub fn read_f32(&self, off: usize, n: usize) -> Result<Vec<f32>> {
+        let raw = self.sub.activations()?.read(&self.dev_api(), off, n * 4)?;
         Ok(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    }
+
+    /// Read `n` f32 back from one sequence's GDN state region (`off` is a `CacheLayout::state`
+    /// offset). Debug/bisect only.
+    pub fn read_cache_f32(&self, off: u64, n: usize) -> Result<Vec<f32>> {
+        let raw = self.sub.caches()?.read(&self.dev_api(), off as usize, n * 4)?;
+        Ok(raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+    }
+
+    /// The GDN state / conv region offsets of one execution for one sequence.
+    pub fn gdn_regions(&self, exec: usize, seq: usize) -> Result<(u64, u64)> {
+        Ok((self.cache_layout.state(exec, seq)? as u64, self.cache_layout.conv(exec, seq)? as u64))
+    }
+
+    /// Stage inputs once, then launch ops `from..to` of the sequence's program **without** the
+    /// graph. Used by the stage bisect (`sn gpu stages`): calling it repeatedly with successive
+    /// ranges runs one pass over the program and stops anywhere, which is what makes "the first
+    /// execution whose output disagrees with the reference" a question with an answer. Also the tool
+    /// for timing a section of the program with events. Staging is separate because staging appends
+    /// to the sequence's cache length: once per token, not once per range.
+    pub fn launch_ops(&mut self, seq: usize, from: usize, to: usize) -> Result<()> {
+        self.seqs[seq].program.launch_range(&self.sub.dev, self.sub.stream, from, to)?;
+        self.sub.sync()
+    }
+
+    /// The whole program, without the graph.
+    pub fn launch_all(&mut self, seq: usize) -> Result<()> {
+        let to = self.seqs[seq].program.len();
+        self.launch_ops(seq, 0, to)
     }
 
     fn dev_api(&self) -> crate::hip::HipApi {
         self.sub.dev.api
+    }
+
+    /// The token id the last replay's argmax wrote into the pinned slot. Four bytes, read from
+    /// memory the device already maps - no copy, no CPU pass over the vocabulary.
+    pub fn sampled(&mut self) -> Result<u32> {
+        let io = self.sub.io_mut().ok_or_else(|| Error::msg("no pinned slot to sample from"))?;
+        let b = io.as_mut_bytes();
+        Ok(u32::from_le_bytes([
+            b[decode::PIN_SAMPLE],
+            b[decode::PIN_SAMPLE + 1],
+            b[decode::PIN_SAMPLE + 2],
+            b[decode::PIN_SAMPLE + 3],
+        ]))
     }
 
     /// Prefill, then decode `n_new` tokens greedily. Returns the sampled tokens (excluding the
@@ -304,10 +405,9 @@ impl Engine {
             self.step(seq, tok, pos)?;
             pos += 1;
             if t + 1 == prompt.len() {
-                let lg = self.logits()?;
-                let next = argmax(&lg);
-                out.push(next as u32);
-                on_token(prompt.len(), next as u32, &lg);
+                let next = self.sampled()?;
+                out.push(next);
+                on_token(prompt.len(), next, &[]);
             }
         }
         let mut cur = *out.last().ok_or_else(|| Error::msg("no token sampled after the prompt"))?;
@@ -320,11 +420,9 @@ impl Engine {
             }
             self.step(seq, cur, pos)?;
             pos += 1;
-            let lg = self.logits()?;
-            let next = argmax(&lg);
-            cur = next as u32;
+            cur = self.sampled()?;
             out.push(cur);
-            on_token(pos as usize, cur, &lg);
+            on_token(pos as usize, cur, &[]);
         }
         Ok(out)
     }

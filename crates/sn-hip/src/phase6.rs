@@ -17,6 +17,11 @@ use crate::kernels::{DType, Kernel, KernelRegistry};
 /// cross-lane reduction, so the workgroup size is the state's row count, not `ops::BLOCK`.
 pub const GDN_DECODE_BLOCK: u32 = 128;
 
+/// The Phase 7 delta rule: one workgroup per v-head, `d_v` state rows x 4 lanes per row. The kernel
+/// keeps a row in the registers of its lanes, so the workgroup size is four times the row count and
+/// `d_v * 4` threads must all be live (a shuffle mask naming an inactive lane hangs gfx1102).
+pub const GDN_DECODE_NORM_BLOCK: u32 = 4 * 128;
+
 /// The attention decode workgroup: 8 wavefronts, each owning one token of an 8-token tile, with
 /// `d_head / 32` accumulator registers per lane. `d_head` is 256 here, which is also why the
 /// shared tiles are sized 8 x 256.
@@ -37,7 +42,9 @@ pub const PHASE6_SPECS: &[(&str, DType, u32)] = &[
     ("sn_gdn_l2norm_f32", DType::F32, PHASE6_BLOCK),
     ("sn_gdn_decode_f32", DType::F32, GDN_DECODE_BLOCK),
     ("sn_gdn_gate_norm_f32", DType::F32, PHASE6_BLOCK),
+    ("sn_gdn_decode_norm_f32", DType::F32, GDN_DECODE_NORM_BLOCK),
     ("sn_gdn_snapshot", DType::F32, PHASE6_BLOCK),
+    ("sn_argmax_f32", DType::F32, 1024),
 ];
 
 pub fn register_phase6(dev: &Device, reg: &mut KernelRegistry) -> Result<usize> {
@@ -64,7 +71,9 @@ pub struct Phase6 {
     pub gdn_l2norm: Kernel,
     pub gdn_decode: Kernel,
     pub gdn_gate_norm: Kernel,
+    pub gdn_decode_norm: Kernel,
     pub snapshot: Kernel,
+    pub argmax: Kernel,
 }
 
 impl Phase6 {
@@ -84,7 +93,9 @@ impl Phase6 {
             gdn_l2norm: g("sn_gdn_l2norm_f32")?,
             gdn_decode: g("sn_gdn_decode_f32")?,
             gdn_gate_norm: g("sn_gdn_gate_norm_f32")?,
+            gdn_decode_norm: g("sn_gdn_decode_norm_f32")?,
             snapshot: g("sn_gdn_snapshot")?,
+            argmax: g("sn_argmax_f32")?,
         })
     }
 }
@@ -394,6 +405,27 @@ pub fn phase6_checks(p6: &Phase6, h: &mut Harness, dims: &sn_core::plan::Dims, d
         let got = h.get_f32(core, nv * dv)?;
         let want = oracle::gdn_gate_norm(&want_core, &wv, &zv, dv, rms_eps);
         out.push(score("gdn_gate_norm", &got, &want, 1e-10));
+
+        // ---- Phase 7: the same two steps in one launch ----------------------------------
+        // A fresh state, because the two kernels above already advanced `st`. The check is the
+        // composition: the state must land where `gdn_decode` put it and the output where the
+        // separate gated norm put it.
+        let st2 = h.alloc(nv * dv * dk * 4)?;
+        let out2 = h.alloc(nv * dv * 4)?;
+        h.put_f32(st2, &sv)?;
+        h.run(
+            "gdn_decode_norm",
+            &p6.gdn_decode_norm,
+            [nv as u32, 1, 1],
+            0,
+            &[
+                h.addr(conv), h.addr(ba), h.addr(sa), h.addr(dt), h.addr(st2),
+                h.addr(w), h.addr(z), h.addr(out2),
+                i(dv), i(dk), i(nk), i(nv), f(rms_eps),
+            ],
+        )?;
+        out.push(score("gdn_decode_norm state", &h.get_f32(st2, nv * dv * dk)?, &want_st, 1e-10));
+        out.push(score("gdn_decode_norm out", &h.get_f32(out2, nv * dv)?, &want, 1e-10));
     }
 
     // ---- snapshot / restore --------------------------------------------------------------

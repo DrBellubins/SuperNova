@@ -131,6 +131,11 @@ impl Drop for Module {
 pub struct KernelRegistry {
     modules: Vec<Module>,
     by_key: BTreeMap<Key, Kernel>,
+    /// `symbol -> parameter count`, from the image sidecar (`Tools/build-kernels.sh`). Used to
+    /// reject a launch whose argument list does not match the compiled kernel: HIP takes the
+    /// arguments as an untyped pointer array, so one extra argument silently shifts every later one
+    /// and the kernel returns a plausible wrong number instead of failing.
+    arity: BTreeMap<String, usize>,
 }
 
 impl KernelRegistry {
@@ -163,8 +168,32 @@ impl KernelRegistry {
                 }
             }
         }
+        if let Ok(text) = std::fs::read_to_string(&meta) {
+            for line in text.lines() {
+                if let Some(rest) = line.strip_prefix("argc_") {
+                    if let Some((name, n)) = rest.split_once('=') {
+                        if let Ok(n) = n.trim().parse::<usize>() {
+                            self.arity.insert(name.to_string(), n);
+                        }
+                    }
+                }
+            }
+        }
         self.modules.push(Module::load(dev, path)?);
         Ok(())
+    }
+
+    /// The parameter count the image was compiled with, if the sidecar records it. `None` means
+    /// "unknown" (an older image), never "zero".
+    pub fn arity(&self, symbol: &str) -> Option<usize> {
+        self.arity
+            .get(symbol)
+            .or_else(|| {
+                // The decode program names kernels by their registered alias (`gemv_q4_k`), the
+                // image by their symbol (`sn_gemv_q4_k`) - see `gemm::PHASE5_SPECS`.
+                self.arity.get(&format!("sn_{symbol}"))
+            })
+            .copied()
     }
 
     /// Resolve `symbol` from the loaded images and register it under `key` with `block`.

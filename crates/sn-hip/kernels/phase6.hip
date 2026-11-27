@@ -468,6 +468,103 @@ extern "C" __global__ void sn_gdn_gate_norm_f32(const float* __restrict__ core, 
     }
 }
 
+// ----------------------------------------------------------------------------------------------
+// Phase 7: the delta rule with the row in registers, and the head's gated norm in the same kernel.
+//
+// `sn_gdn_decode_f32` above is the honest transcription of §2.4 and it is correct to 1e-14, but the
+// profile says it costs 17.8 ms of a 92 ms token (`Docs/bench.md` §5.2): one thread per state row
+// means 4 096 threads per launch on 16 CUs, and it walks the state three times (read-write,
+// read-write, read). The state is 176 MB read+written per token across 42 executions, so at any
+// reasonable bandwidth this kernel should cost ~2 ms - it was latency-bound, not bandwidth-bound.
+//
+// The fix is the shape the arithmetic allows: a state row is independent of every other row, and
+// `predict`/`read` are dot products over one row, so a row can live in the registers of a *group of
+// lanes* (`SN_GDN_LANES`) instead of one thread. The workgroup is still one v-head; each row is now
+// `SN_GDN_LANES` lanes holding `dk/LANES` floats each, read once, written once, and the two
+// row-wide reductions are a 4-lane butterfly. The head's gated norm needs every row of the head,
+// which is exactly what one workgroup has, so the separate `sn_gdn_gate_norm_f32` launch (42 per
+// token) and its round trip through `gdn_core` disappear.
+// ----------------------------------------------------------------------------------------------
+
+#define SN_GDN_LANES 4
+
+extern "C" __global__ void sn_gdn_decode_norm_f32(const float* __restrict__ conv, const float* __restrict__ ba,
+                                                  const float* __restrict__ ssm_a, const float* __restrict__ dt_bias,
+                                                  float* __restrict__ state, const float* __restrict__ norm_w,
+                                                  const float* __restrict__ z, float* __restrict__ out,
+                                                  int d_v, int dk, int n_k_heads, int n_v_heads, float eps) {
+    // grid: n_v_heads workgroups, block: d_v * SN_GDN_LANES threads. Every lane is live, so the
+    // butterfly masks below name only active lanes (a mask naming an inactive lane hangs gfx1102).
+    const int h = blockIdx.x;
+    const int row = (int)threadIdx.x / SN_GDN_LANES;
+    const int ln = (int)threadIdx.x % SN_GDN_LANES;
+    const unsigned long long m64 = 0xffffffffffffffffull;
+    const int kw = dk / SN_GDN_LANES; // values of one row per lane
+
+    const float beta = ba[h];
+    const float gate = ssm_a[h] * sn6_softplus(ba[n_v_heads + h] + dt_bias[h]);
+    const float decay = expf(gate);
+    const int kh = h % n_k_heads;
+
+    // conv layout: q | k | v, `n_k_heads` blocks of dk for q and k, `n_v_heads` of d_v for v.
+    const float* kt = conv + (long)n_k_heads * dk + (long)kh * dk + (long)ln * kw;
+    const float* qt = conv + (long)kh * dk + (long)ln * kw;
+    const float* vt = conv + 2 * (long)n_k_heads * dk + (long)h * d_v;
+    float* r = state + (long)h * d_v * dk + (long)row * dk + (long)ln * kw;
+
+    float s[64];
+    float pred = 0.0f;
+    if (row < d_v) {
+#pragma unroll
+        for (int j = 0; j < 64; j++) {
+            if (j >= kw) break;
+            const float v = r[j] * decay;
+            s[j] = v;
+            pred += v * kt[j];
+        }
+    }
+    for (int off = 1; off < SN_GDN_LANES; off <<= 1) pred += __shfl_xor_sync(m64, pred, off, SN_GDN_LANES);
+    const float delta = (row < d_v ? vt[row] : 0.0f) - pred;
+    float o = 0.0f;
+    if (row < d_v) {
+        const float d = delta * beta;
+#pragma unroll
+        for (int j = 0; j < 64; j++) {
+            if (j >= kw) break;
+            const float v = s[j] + kt[j] * d;
+            s[j] = v;
+            o += v * qt[j];
+        }
+    }
+    for (int off = 1; off < SN_GDN_LANES; off <<= 1) o += __shfl_xor_sync(m64, o, off, SN_GDN_LANES);
+    if (row < d_v) {
+#pragma unroll
+        for (int j = 0; j < 64; j++) {
+            if (j >= kw) break;
+            r[j] = s[j]; // one write of the state, from registers
+        }
+    }
+    const float core = o / sqrtf((float)dk); // §2.4: the 1/sqrt(128) factor is real
+
+    // ---- the head's gated norm: rms over the head's d_v outputs, then * ssm_norm * silu(z) ----
+    __shared__ float osh[512];
+    __shared__ float red[32]; // up to 1024/32 wavefronts; only `nw` of them are read
+    const int nw = (int)(blockDim.x / 32);
+    if (ln == 0 && row < d_v) osh[row] = core;
+    __syncthreads();
+    float ss = 0.0f;
+    for (int i = (int)threadIdx.x; i < d_v; i += (int)blockDim.x) ss += osh[i] * osh[i];
+    ss = sn6_wave_sum(ss);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x / 32] = ss;
+    __syncthreads();
+    float tot = 0.0f;
+    for (int w2 = 0; w2 < nw; w2++) tot += red[w2];
+    const float inv = rsqrtf(tot / (float)d_v + eps);
+    if (ln == 0 && row < d_v) {
+        out[(long)h * d_v + row] = osh[row] * inv * norm_w[row] * sn6_silu(z[(long)h * d_v + row]);
+    }
+}
+
 /// Snapshot / restore of the GDN state and conv windows: Phase 6's prefix-cache primitive and
 /// Phase 9's rollback. One kernel for both halves, because a snapshot is only ever valid as a pair
 /// (`cache::Sessions::check_pair`). `stride_*` are the per-execution strides in the live region, so
@@ -492,4 +589,47 @@ extern "C" __global__ void sn_gdn_snapshot(float* __restrict__ live_state, float
         if (to_snapshot) snap_conv[e * conv_stride + o] = live_conv[e * conv_stride + o];
         else live_conv[e * conv_stride + o] = snap_conv[e * conv_stride + o];
     }
+}
+
+// ----------------------------------------------------------------------------------------------
+// Phase 7: greedy sampling inside the program.
+//
+// The decode loop's contract is "write a token id and a position, launch one graph" (design-plan
+// §6 P1). Reading 248 320 logits back to the host to take an argmax breaks it twice: a ~1 MB
+// hipMemcpy per token, and a CPU pass over the vocabulary. So the argmax runs in the program and
+// writes the *id* into the pinned slot the host already owns - a device write into host-pinned
+// memory, not a copy. After the replay the host reads four bytes.
+// ----------------------------------------------------------------------------------------------
+
+extern "C" __global__ void sn_argmax_f32(const float* __restrict__ logits, int n, int* __restrict__ out_id) {
+    // One workgroup, block 1024: each thread scans a strided range keeping (best, index), then the
+    // block reduces that pair. Deterministic: ties go to the lowest index, on every lane, because
+    // the comparison is strict and the reduce is fixed-order.
+    __shared__ float bv[1024];
+    __shared__ int bi[1024];
+    float lb = -INFINITY;
+    int li = -1;
+    for (int i = (int)threadIdx.x; i < n; i += (int)blockDim.x) {
+        const float v = logits[i];
+        if (v > lb) {
+            lb = v;
+            li = i;
+        }
+    }
+    bv[threadIdx.x] = lb;
+    bi[threadIdx.x] = li;
+    __syncthreads();
+    // The fold is over the fixed 1024-wide array, in a fixed order, for every thread: same answer
+    // in every lane, no atomics, no second kernel.
+    for (int w = 1; w < (int)blockDim.x; w <<= 1) {
+        __syncthreads();
+        for (int i = (int)threadIdx.x; i < (int)blockDim.x; i += (w << 1)) {
+            const int j = i + w;
+            if (j < (int)blockDim.x && bv[j] > bv[i]) {
+                bv[i] = bv[j];
+                bi[i] = bi[j];
+            }
+        }
+    }
+    if (threadIdx.x == 0 && bi[0] >= 0) *out_id = bi[0];
 }

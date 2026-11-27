@@ -101,7 +101,7 @@ fn phase4_route_replays_the_phase2_golden_stages() {
 }
 
 /// Gate: what a decode step costs in launches, with and without the Phase 4 fusions. The plan's
-/// "<= 300 nodes" target is NOT met and is reported as such (Docs/bench.md): the trunk alone has
+/// "<= 300 nodes" target is NOT met and is reported as such (Docs/bench.md §5.3): the trunk alone has
 /// ~350 weight matrices and 96 routing applications, so the honest claim is the measured ladder.
 #[test]
 fn phase4_decode_step_op_counts_are_recorded() {
@@ -139,8 +139,36 @@ fn phase4_decode_step_op_counts_are_recorded() {
     };
     let seeds = at("sn_mhc_seed_f32");
     let exposes = at("sn_mhc_expose_f32");
-    assert_eq!(seeds.len(), 1, "the streams are seeded exactly once, at the first mHC execution");
-    assert_eq!(exposes.len(), 1, "the exposure appears exactly once, at the mHC -> non-mHC boundary");
+    // §2.7 as the reference actually runs it: the streams are seeded at the first execution of
+    // *every pass through the loop* (`physical == mhc.start`), not once per trunk, and every seed
+    // after the first seeds from what the previous pass exposed. Getting this wrong is silent: the
+    // second pass just continues the first pass's streams, and the forward is 3e-2 off (found
+    // 2026-11-27 by `sn gpu stages`, which names the first execution that leaves the reference).
+    let reseed_execs = (0..plan.n_exec())
+        .filter(|&il| plan.exec(il).mtp == 0 && plan.exec(il).mhc && plan.exec(il).physical == plan.hp.mhc_start)
+        .count();
+    assert_eq!(seeds.len(), reseed_execs, "one stream seed per pass through the loop, at its first mHC execution");
+    assert!(seeds.len() >= 2, "this checkpoint loops, so there must be more than one seed to assert against");
+    let last_mhc = (0..plan.n_exec())
+        .filter(|&il| plan.exec(il).mtp == 0 && plan.exec(il).mhc)
+        .max()
+        .expect("the trunk has mHC executions");
+    let boundary_expose = (0..plan.n_exec())
+        .any(|k| k > last_mhc && plan.exec(k).mtp == 0 && !plan.exec(k).mhc) as usize;
+    assert_eq!(
+        exposes.len(),
+        seeds.len() - 1 + boundary_expose,
+        "an exposure before every re-seed plus the one at the mHC -> non-mHC boundary"
+    );
+    for w in 1..seeds.len() {
+        assert_eq!(
+            seeds[w],
+            exposes[w - 1] + 1,
+            "the re-seed must read the exposure that precedes it (seed {} follows expose {})",
+            seeds[w],
+            exposes[w - 1]
+        );
+    }
     let first_route = fused.ops.iter().position(|o| o.kernel == "sn_mhc_route_f32").expect("a route op exists");
     assert!(seeds[0] < first_route, "the seed must precede the first route");
     let trunk: Vec<usize> = (0..plan.n_exec()).filter(|&k| plan.exec(k).mtp == 0).collect();

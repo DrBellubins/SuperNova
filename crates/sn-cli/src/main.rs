@@ -33,6 +33,13 @@ usage:
   sn gpu gemm --model M                    every GEMV/GEMM shape in the model vs sn-core's dequant (Phase 5)
   sn bench gemm --model M [--gemm-t L]     GEMV bandwidth sweep, auto-pick table, GEMM throughput (Phase 5)
   sn gpu kernels                           every Phase 4 kernel against its scalar oracle
+  sn gpu phase6 --model M                  every cache/recurrence kernel against its scalar oracle
+  sn gpu stages --model M --golden ID      replay the decode program one execution at a time and
+                                         name the first one that leaves the Phase 2 stage dumps
+  sn run --model M --golden ID [-n N] [--ctx C] [--kv f16|q8_0|q4_0]
+         [--ref-tokens K] [--bench N] [--drop cls,..] [--drop-match label-substring]
+         [--raw|--fused]                   prefill + decode on the GPU; the Phase 6/7 gates
+                                         (logits NMSE, t/s, per-class cost, VRAM)
   sn gpu route --model M --dump DIR        the fused route vs Phase 2 stage dumps
                                          (dump with: sn ref --dump DIR --dump-only mhc.,l.,l_out.,gdn.,ffn.)
 
@@ -277,10 +284,12 @@ fn cmd_gpu(positional: &[String], opt_val: &impl Fn(&str) -> Option<String>) -> 
         Some("route") => gpu::cmd_route(positional, opt_val),
         Some("gemm") => gpu::cmd_gemm(opt_val, false),
         Some("phase6") => gpu::cmd_phase6(opt_val),
+        Some("stages") => gpu::cmd_stages(positional, opt_val),
         _ => Ok("sn gpu kernels
 sn gpu route --model <gguf> --dump <dir> [--execs 4-11]
 sn gpu gemm  --model <gguf>
 sn gpu phase6 --model <gguf>
+sn gpu stages --model <gguf> --golden <id> [--step N]
 ".into()),
     }
 }

@@ -136,6 +136,11 @@ pub struct ProgramSpec {
     pub fusion: Fusion,
     /// Bytes of activation arena the program addresses, i.e. the arena `Slots` reserved.
     pub arena_bytes: usize,
+    /// `(execution, exclusive op index)` for every trunk execution, in order. This is what lets a
+    /// debug run stop the program after execution *N* and compare the arena against the Phase 2
+    /// stage dump for *N* — the bisect tool for "the forward is wrong, which block is wrong".
+    /// Without it, finding the first wrong block means reading 900 labels by eye.
+    pub exec_ends: Vec<(usize, usize)>,
 }
 
 impl ProgramSpec {
@@ -213,6 +218,20 @@ impl ProgramSpec {
                     return Err(Error::msg(format!("{}: kernel {} is not registered", o.label, o.kernel)))
                 }
             };
+            // The ABI guard: the image records how many parameters each entry point takes, and a
+            // launch that passes a different number is a wrong-number bug waiting to happen, not a
+            // fault. HIP itself never notices.
+            if let Some(n) = reg.arity(&o.kernel) {
+                if n != o.args.len() {
+                    return Err(Error::msg(format!(
+                        "{}: {} takes {n} arguments but this launch passes {} - the kernel image and \
+                         decode.rs disagree about the ABI (run Tools/build-kernels.sh if the image is stale)",
+                        o.label,
+                        o.kernel,
+                        o.args.len()
+                    )));
+                }
+            }
             b.kernel(&o.label, k, o.grid, o.shared, &o.args)?;
             n += 1;
         }
@@ -334,6 +353,9 @@ impl CacheArgs<'_> {
 /// reads the current cache length from. A captured graph takes new inputs without being rebuilt.
 pub const PIN_POS: usize = 0;
 pub const PIN_TOKEN: usize = 4;
+/// Where the program's own argmax writes the token id it sampled (see `sn_argmax_f32`): the host
+/// reads four bytes instead of copying back the vocabulary.
+pub const PIN_SAMPLE: usize = 128;
 pub const PIN_META: usize = 256;
 pub const PIN_BYTES: usize = 4096;
 
@@ -403,6 +425,7 @@ fn compile_inner(
     let mut b = Builder {
         ops: Vec::new(),
         inputs: Vec::new(),
+        exec_ends: Vec::new(),
         cache,
         bases,
         slots: slots.clone(),
@@ -466,7 +489,16 @@ fn compile_inner(
         // Inside the mHC range the branch reads the route's `in`; outside it, `cur` (§2.2, §2.7).
         // Nothing outside the range has written `a`/`b`, so they are seeded here, from the hidden
         // state that reaches the first mHC execution - the same `a = b = cur` `forward.rs` does.
-        if mhc && !prev_mhc {
+        if mhc && ex.physical == hp.mhc_start {
+            // §2.7: the streams come into existence at the *first* execution of every loop pass,
+            // not once per trunk. The reference re-seeds whenever `physical == mhc.start` (logical 4
+            // and logical 28 here), and what it seeds from is the hidden state the previous
+            // execution exposed, i.e. `0.5*(a+b)`. Skipping that is silent: the second pass simply
+            // continues the first pass's streams, which is a plausible-looking forward whose logits
+            // are 3e-2 off (measured 2026-11-27, `sn gpu stages`).
+            if prev_mhc {
+                b.expose_streams();
+            }
             b.seed_streams(blk);
         }
         let x_src = if mhc {
@@ -496,6 +528,11 @@ fn compile_inner(
                 if b.fusion.norm_into_gemv { Some(norm_name.as_str()) } else { None },
                 blk,
             )?;
+            // The *second* GEMV that reads this execution's normalised input. With `norm_into_gemv`
+            // there is no buffer holding the normalised vector, so each GEMV that reads one has to
+            // fold the norm itself: leaving it off here made beta/alpha come out of the *un*normalised
+            // hidden state - a plausible wrong gate, not a fault (found 2026-11-27 by `sn run
+            // --raw`, which matches the reference to 3e-12 and is 6.8e-3 off with the fold on).
             b.gemv(
                 &format!("gemv beta_alpha blk.{blk}"),
                 &t("ssm_beta_alpha.weight"),
@@ -503,7 +540,7 @@ fn compile_inner(
                 slots.ba,
                 d,
                 2 * dm.n_v_heads,
-                None,
+                if b.fusion.norm_into_gemv { Some(norm_name.as_str()) } else { None },
                 blk,
             )?;
             // beta = sigmoid(beta_raw), in place over the first half of the fused projection.
@@ -551,13 +588,18 @@ fn compile_inner(
                 0,
                 vec![b.a(slots.conv_out), b.a(slots.conv_out), i(dm.d_k), Arg::F32(hp.rms_eps)],
             );
+            // The Phase 7 form: the delta rule and the head's gated norm in one launch. The state
+            // row lives in registers, the head's outputs stay in shared memory, and the separate
+            // `sn_gdn_gate_norm_f32` launch (42 per token) plus its round trip through `gdn_core`
+            // are gone. The argument order is the kernel's: geometry after the buffers, and `eps`
+            // last - `ProgramSpec::build` checks the count against the image.
             b.push(
-                &format!("gdn step blk.{blk}"),
+                &format!("gdn step+gate_norm blk.{blk}"),
                 "recur",
-                if have_gdn { "sn_gdn_decode_f32" } else { "gdn_decode" },
+                if have_gdn { "sn_gdn_decode_norm_f32" } else { "gdn_decode_norm" },
                 !have_gdn,
                 [dm.n_v_heads as u32, 1, 1],
-                crate::phase6::GDN_DECODE_BLOCK,
+                crate::phase6::GDN_DECODE_NORM_BLOCK,
                 0,
                 vec![
                     b.a(slots.conv_out),
@@ -565,29 +607,13 @@ fn compile_inner(
                     b.w(&t("ssm_a"))?,
                     b.w(&t("ssm_dt.bias"))?,
                     match state_ptr { Some(p) => p, None => Arg::U64(0) },
-                    b.a(slots.gdn_core),
-                    i(dm.n_v_heads),
-                    i(dm.d_v),
-                    i(dm.d_k),
-                    i(dm.n_k_heads),
-                ],
-            );
-            // out = (rms(core) * ssm_norm) * silu(z): one fused gated norm (§2.4).
-            b.push(
-                &format!("gdn gate_norm blk.{blk}"),
-                "gate",
-                if have_gdn { "sn_gdn_gate_norm_f32" } else { "gdn_gate_norm" },
-                !have_gdn,
-                grid1d(dm.n_v_heads * dm.d_v),
-                BLOCK,
-                0,
-                vec![
-                    b.a(slots.gdn_core),
                     b.w(&t("ssm_norm.weight"))?,
                     b.a_off(slots.qkvz + f32s(dm.qkv_width)),
                     b.a(slots.gdn_core),
-                    i(dm.n_v_heads),
                     i(dm.d_v),
+                    i(dm.d_k),
+                    i(dm.n_k_heads),
+                    i(dm.n_v_heads),
                     Arg::F32(hp.rms_eps),
                 ],
             );
@@ -835,6 +861,9 @@ fn compile_inner(
         if mhc && !next_mhc {
             b.expose_streams();
         }
+        // The exclusive end of this execution's ops: `sn gpu stages` replays the program up to here
+        // and compares the arena with the reference's `l_out.<il>` stage.
+        b.exec_ends.push((il, b.ops.len()));
     }
 
     // ---- the head -------------------------------------------------------------------
@@ -842,12 +871,29 @@ fn compile_inner(
     // boundary when the mHC region does not reach the end of the trunk.
     b.rmsnorm("rmsnorm output", slots.cur, "output_norm.weight", slots.h, 0)?;
     b.gemv("gemv output head", "output.weight", slots.h, slots.head, d, hp.vocab, None, 0)?;
+    // Greedy sampling, in the program: the id lands in the pinned slot the host is already holding,
+    // so the decode loop never copies the vocabulary back (Phase 7's "no hipMemcpy in the loop").
+    // Only emitted for a program that can actually launch it (a pinned slot exists and the kernel is
+    // registered), because a counted-only program must not claim a launch it cannot make.
+    if bases.pinned != 0 {
+        b.push(
+            "sample argmax",
+            "sample",
+            "sn_argmax_f32",
+            false,
+            [1, 1, 1],
+            1024,
+            0,
+            vec![b.a(slots.head), i(hp.vocab), b.u_pin(bases.pinned + crate::decode::PIN_SAMPLE as u64)],
+        );
+    }
 
     Ok(ProgramSpec {
         ops: b.ops,
         inputs: b.inputs,
         fusion,
         arena_bytes,
+        exec_ends: b.exec_ends,
     })
 }
 
@@ -856,6 +902,7 @@ fn compile_inner(
 struct Builder<'a> {
     ops: Vec<OpSpec>,
     inputs: Vec<(String, u64, u64, usize)>,
+    exec_ends: Vec<(usize, usize)>,
     cache: Option<&'a CacheArgs<'a>>,
     bases: Bases,
     slots: Slots,
@@ -870,6 +917,9 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
+    fn u_pin(&self, addr: u64) -> Arg {
+        Arg::Ptr(addr)
+    }
     fn a(&self, off: usize) -> Arg {
         Arg::Ptr(self.bases.activations + off as u64)
     }
@@ -1216,11 +1266,94 @@ mod tests {
             inputs: vec![],
             fusion: Fusion::RAW,
             arena_bytes: 0,
+            exec_ends: vec![(0, 3)],
         };
         assert_eq!(spec.len(), 3);
         assert_eq!(spec.pending(), 2);
         assert_eq!(spec.launchable(), 1);
         assert_eq!(spec.counts()[0], ("gemv", 2));
+    }
+
+    /// Phase 7, part 1: the stream hand-off at the loop boundary, asserted as emitted structure.
+    ///
+    /// The reference seeds the mHC streams at the first execution of **every pass through the loop**
+    /// (`physical == mhc.start`), and what it seeds from is what the previous pass exposed,
+    /// `0.5*(a+b)`. Before this was known the second pass simply continued the first pass's streams:
+    /// no fault, no NaN, logits 3e-2 off, and the first execution that diverged was invisible
+    /// without `sn gpu stages`. So the invariant is asserted where it is produced.
+    #[test]
+    fn the_loop_re_seeds_the_streams_from_what_the_previous_pass_exposed() {
+        let plan = sn_core::plan::fixture_plan().expect("fixture plan");
+        let mut act = crate::arena::Arena::new("a");
+        let (slots, bytes) = Slots::reserve(&mut act, &plan, 8).unwrap();
+        let bases = Bases {
+            activations: 0x1_0000,
+            weights: 0x2_0000,
+            pinned: 0x3_0000,
+            ..Default::default()
+        };
+        let spec = compile(&plan, &slots, bases, bytes, Fusion::RAW, &|_| Ok((0, "q4_k".to_string())))
+            .expect("the fixture plan compiles");
+
+        let passes = (0..plan.n_exec())
+            .filter(|&il| plan.exec(il).mtp == 0 && plan.exec(il).mhc && plan.exec(il).physical == plan.hp.mhc_start)
+            .count();
+        assert!(passes >= 2, "the fixture loops, so there are {passes} stream seeds to assert");
+        let seed = spec.ops.iter().filter(|o| o.kernel == "sn_mhc_seed_f32").count();
+        assert_eq!(seed, passes, "one seed per pass, not one per trunk");
+
+        // Every seed after the first is preceded immediately by the exposure it reads.
+        // The order the two hand-off kernels appear in, and nothing else.
+        let seq: Vec<&str> = spec
+            .ops
+            .iter()
+            .filter(|o| o.kernel == "sn_mhc_seed_f32" || o.kernel == "sn_mhc_expose_f32")
+            .map(|o| o.kernel.as_str())
+            .collect();
+        let mut seen_seed = 0;
+        for (p, k) in seq.iter().enumerate() {
+            if *k == "sn_mhc_seed_f32" {
+                if seen_seed > 0 {
+                    assert_eq!(seq[p - 1], "sn_mhc_expose_f32", "the {seen_seed}-nd seed has no exposure before it");
+                }
+                seen_seed += 1;
+            }
+        }
+        assert_eq!(seen_seed, passes);
+        // The pass boundary is a *second* hand-off, distinct from the mHC -> non-mHC exposure before
+        // the exit blocks; both must exist.
+        let expose = spec.ops.iter().filter(|o| o.kernel == "sn_mhc_expose_f32").count();
+        assert!(expose >= passes, "a re-seed exposure per pass plus the boundary exposure: got {expose}");
+    }
+
+    /// Phase 7, part 2: the two GDN launches became one. The op count is the gate's currency, and a
+    /// fusion that only exists in a comment is worth nothing, so the count is asserted structurally
+    /// (same style as `tests/phase5.rs`).
+    #[test]
+    fn the_gdn_branch_emits_one_recurrent_launch_per_execution() {
+        let plan = sn_core::plan::fixture_plan().expect("fixture plan");
+        let mut act = crate::arena::Arena::new("a");
+        let (slots, bytes) = Slots::reserve(&mut act, &plan, 8).unwrap();
+        let spec = compile(&plan, &slots, Bases::default(), bytes, Fusion::RAW, &|_| Ok((0, "q4_k".to_string())))
+            .expect("the fixture plan compiles");
+        let gdn_execs = (0..plan.n_exec()).filter(|&il| plan.exec(il).mtp == 0 && plan.exec(il).recurrent).count();
+        let fused = spec.ops.iter().filter(|o| o.kernel == "gdn_decode_norm").count();
+        assert_eq!(fused, gdn_execs, "one fused delta-rule launch per GDN execution");
+        for gone in ["gdn_decode", "gdn_gate_norm"] {
+            assert!(spec.ops.iter().all(|o| o.kernel != gone), "{gone} is still emitted; the fused kernel replaced it");
+        }
+        // And the sampler is part of the program when the program can be launched at all.
+        let spec2 = compile(
+            &plan,
+            &slots,
+            Bases { activations: 1, weights: 2, pinned: 3, ..Default::default() },
+            bytes,
+            Fusion::RAW,
+            &|_| Ok((0, "q4_k".to_string())),
+        )
+        .expect("compiles with a pinned slot");
+        assert_eq!(spec2.ops.iter().filter(|o| o.kernel == "sn_argmax_f32").count(), 1, "greedy sampling lives in the program");
+        assert_eq!(spec.ops.iter().filter(|o| o.kernel == "sn_argmax_f32").count(), 0, "a counting-only program does not claim it");
     }
 
     #[test]
