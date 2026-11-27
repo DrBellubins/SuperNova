@@ -15,13 +15,13 @@
 # only the continuation: `Tools/ask.sh ... 2>/dev/null`, or --quiet, to drop it.
 #
 # Model defaults to $SN_MODEL, then the SenseNova-Loop-9B-Q4_K_M.gguf path in Docs/bench.md.
-# Needs the same prerequisites as any Phase 6 run: `cargo build --release`, Tools/{tok,detok},
-# and `./Tools/build-kernels.sh` (the kernel image in target/hip/).
+# Needs the same prerequisites as any Phase 6 run: `cargo build --release` (in Engine/),
+# Tools/{tok,detok}, and `./Tools/build-kernels.sh` (the kernel images in Engine/target/hip/).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 MODEL=${SN_MODEL:-/home/justin/Documents/AI/Models/SenseLoop/SenseNova-Loop-9B-Q4_K_M.gguf}
-SN=$ROOT/target/release/sn
+SN=$ROOT/Engine/target/release/sn
 QUIET=0
 PROMPT=""
 EXTRA=()

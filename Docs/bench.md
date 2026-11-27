@@ -3,6 +3,29 @@
 Every number here is produced by a command in this file on this host (RX 7700S, `gfx1102`, ROCm
 10.1 / HIP 7.16). "Faster" is not a result; a delta with a command line is (design-plan §8).
 
+### 0. Where things live, and where commands run
+
+```
+Engine/                       # the cargo workspace: Cargo.toml, crates/{sn-core,sn-hip,sn-cli}, target/
+  target/hip/*.fatbin         # kernel images built by Tools/build-kernels.sh
+  target/release/sn           # the CLI
+Docs/                         # this file, design-plan.md, numerics.md, baseline.md, the golden corpus
+Tools/                        # build-kernels.sh, the .py/.sh checkers, tok/detok/sn-oracle (C)
+```
+
+**Every command line in these docs runs from the repository root**, and cargo commands are written
+`(cd Engine && cargo …)` to keep that true. The reverse is not required: the engine resolves its two
+repository-relative resources — the kernel images (`Engine/target/hip`) and the frozen corpus
+(`Docs/golden/expected.tsv`) — by searching its working directory, its ancestors and the
+executable's own directory (`sn-core/src/paths.rs`, `sn-hip/src/bench.rs::image_dir`), so a binary
+started from `Engine/` finds them too. `SN_KERNELS=a:f` still overrides the image list outright,
+and `--expected <path>` / `--model` / `--tokens-file` are always used verbatim.
+
+```sh
+cd Engine && cargo build --release            # the binary at Engine/target/release/sn
+./Tools/build-kernels.sh                      # from anywhere: writes Engine/target/hip/*.fatbin
+```
+
 ## 1. Phase 3 — HIP substrate and static program gate (2026-11-26)
 
 ### 1.0 Device of record (`sn hip info`)
@@ -17,7 +40,7 @@ device 0  AMD Radeon RX 7700S
   clocks             SM 2208 MHz, mem native 1124 MHz x 128 bit (no bandwidth derived here)
 ```
 
-Reproduce: `./target/release/sn hip info`. Two facts to keep in mind:
+Reproduce: `Engine/target/release/sn hip info`. Two facts to keep in mind:
 
 * **HIP reports 16 multiprocessors; `rocminfo` reports 40 CUs** for the same device
   (`Compute Unit : gfx1102`, `simd_count 64 / simd_per_cu 2` in `Docs/baseline.md` §0). Phase 5 must
@@ -32,8 +55,8 @@ Reproduce: `./target/release/sn hip info`. Two facts to keep in mind:
 ### 1.1 Build the kernel image, then run the gate
 
 ```sh
-./Tools/build-kernels.sh                      # .hip -> target/hip/phase3.fatbin for every gfx reported
-./target/release/sn bench graph --ops 1000 --reps 200
+./Tools/build-kernels.sh                      # .hip -> Engine/target/hip/phase3.fatbin for every gfx reported
+Engine/target/release/sn bench graph --ops 1000 --reps 200
 ```
 
 Gate result (`--ops 1000 --reps 200`, 1 step of dependent work per op):
@@ -57,13 +80,13 @@ GATE: PASS
 | host time per replay < 30 µs | **6.5 µs** (5.6–8.8 µs across runs, `--steps-per-op` 1…64) | **pass**, 4.5× margin |
 | repeated replays bit-identical | 32 replays of the 1000-op chain, byte-identical output | **pass** |
 
-The same three assertions run as a test (`crates/sn-hip/tests/phase3.rs`, 200 ops × 60 replays, plus a
+The same three assertions run as a test (`Engine/crates/sn-hip/tests/phase3.rs`, 200 ops × 60 replays, plus a
 check that a captured graph still replays with its baked pointers after its capture stream is destroyed).
-It skips with a printed reason when there is no HIP device or no built image, so `cargo test` stays
-usable without ROCm:
+It skips with a printed reason when there is no HIP device or no built image, so `(cd Engine &&
+cargo test)` stays usable without ROCm:
 
 ```sh
-./Tools/build-kernels.sh && cargo test -p sn-hip
+./Tools/build-kernels.sh && (cd Engine && cargo test -p sn-hip)
 # test phase3_graph_gate ... ok
 # test captured_graph_survives_its_capture_stream ... ok
 ```
@@ -83,7 +106,7 @@ is exactly a dependent L2-latency chain), while a *node* costs ~2.9 µs. The rat
 of SuperNova. Sweeping work per node shows the curve, and that curve is the design input:
 
 ```sh
-for k in 1 4 16 64; do ./target/release/sn bench graph --ops 1000 --reps 100 --steps-per-op $k; done
+for k in 1 4 16 64; do Engine/target/release/sn bench graph --ops 1000 --reps 100 --steps-per-op $k; done
 ```
 
 | steps per op | graph (ns/op) | direct launch (ns/op) | graph faster by | graph / launch-free |
@@ -111,7 +134,7 @@ Reading, and what Phase 5/7 must respect:
 ### 1.3 The real checkpoint through the single weight allocation
 
 ```sh
-./target/release/sn hip info --weights ~/Documents/AI/Models/SenseLoop/SenseNova-Loop-9B-Q4_K_M.gguf
+Engine/target/release/sn hip info --weights ~/Documents/AI/Models/SenseLoop/SenseNova-Loop-9B-Q4_K_M.gguf
 ```
 
 ```
@@ -128,20 +151,20 @@ leave only 2.57 GB free on this 8 GB card: the §3 KV budget is not optional.
 
 ### 1.4 What Phase 3 is (files)
 
-* `crates/sn-hip/src/hip.rs` — `dlopen`/`dlsym` bindings over `libamdhip64` (no `hipcc`, no bindgen,
+* `Engine/crates/sn-hip/src/hip.rs` — `dlopen`/`dlsym` bindings over `libamdhip64` (no `hipcc`, no bindgen,
   no build script), device open, attributes, error mapping.
-* `crates/sn-hip/src/arena.rs` — `Arena`/`Layout`: named slots, compile-time offsets, alignment,
+* `Engine/crates/sn-hip/src/arena.rs` — `Arena`/`Layout`: named slots, compile-time offsets, alignment,
   duplicate/overlap/zero-length rejection, freeze-before-use.
-* `crates/sn-hip/src/kernels.rs` — fat-binary loading and the `(name, shape, dtype)` registry
+* `Engine/crates/sn-hip/src/kernels.rs` — fat-binary loading and the `(name, shape, dtype)` registry
   (shape-generic fallback; a missing specialization is an error that names the key).
-* `crates/sn-hip/src/program.rs` — `Op`/`Arg` with baked pointers, `ProgramBuilder`, the flat
+* `Engine/crates/sn-hip/src/program.rs` — `Op`/`Arg` with baked pointers, `ProgramBuilder`, the flat
   `--no-graph` launcher, stream capture → `hipGraphInstantiate` → one `hipGraphLaunch`, `SN_TRACE`,
   event `Timer`.
-* `crates/sn-hip/src/bench.rs` — the gate above, as code (`sn bench graph`).
-* `crates/sn-hip/src/lib.rs` — `Substrate`: device, stream, **three** slabs (weights = one
+* `Engine/crates/sn-hip/src/bench.rs` — the gate above, as code (`sn bench graph`).
+* `Engine/crates/sn-hip/src/lib.rs` — `Substrate`: device, stream, **three** slabs (weights = one
   `hipMalloc` + one `hipMemcpy` of `Gguf::data_section()`, so a tensor's device address is
   `base + gguf_offset`), pinned host I/O.
-* `crates/sn-hip/kernels/phase3.hip` + `Tools/build-kernels.sh` — the kernel image recipe above.
+* `Engine/crates/sn-hip/kernels/phase3.hip` + `Tools/build-kernels.sh` — the kernel image recipe above.
 
 Not yet done (deliberately): wiring a real model's forward through the program (that is Phase 6/7 —
 it needs the kernels), and `hipGraphExec` node updates (never needed if inputs come in through pinned
@@ -152,12 +175,12 @@ memory, which §1.1 confirms works).
 ### 2.0 The four gates, as commands
 
 ```bash
-./Tools/build-kernels.sh gfx1102                      # -> target/hip/{phase3,phase4}.fatbin (+ .meta)
-./target/release/sn gpu kernels                       # every kernel vs its scalar oracle
+./Tools/build-kernels.sh gfx1102                      # -> Engine/target/hip/{phase3,phase4}.fatbin (+ .meta)
+Engine/target/release/sn gpu kernels                       # every kernel vs its scalar oracle
 Tools/kernel-check.py --dump /tmp/stage               # routing vs Phase 2 stage dumps (real weights)
-./target/release/sn bench fusion --reps 200           # fused route vs the fork's 480-node balancing
-./target/release/sn hip ops --model $M --ladder       # launches per decode step, fusion by fusion
-cargo test --workspace                                # all of the above as tests (60 green)
+Engine/target/release/sn bench fusion --reps 200           # fused route vs the fork's 480-node balancing
+Engine/target/release/sn hip ops --model $M --ladder       # launches per decode step, fusion by fusion
+(cd Engine && cargo test --workspace)                    # all of the above as tests (60 green)
 ```
 
 `build-kernels.sh` output must stay visible. It failed silently once this phase (its output had been
@@ -166,7 +189,7 @@ of a debugging session — see §2.5.
 
 ### 2.1 Kernel vs oracle — 25 checks, 0 failing (`sn gpu kernels`)
 
-Every kernel in `crates/sn-hip/kernels/phase4.hip` has a scalar twin in `sn-core/src/oracle.rs`; the
+Every kernel in `Engine/crates/sn-hip/kernels/phase4.hip` has a scalar twin in `Engine/crates/sn-core/src/oracle.rs`; the
 harness feeds both the same buffers and compares bit-for-bit-ish (NMSE over the whole output):
 
 | kernel | NMSE | note |
@@ -307,25 +330,25 @@ than drifting.
   launcher picks the *runtime* workgroup size. With the fatbin built for one size and Rust launching
   another, the reduction reads outside `red`: every router logit but the first came back wrong, the
   numbers moved when the `sharedBytes` launch argument changed, and nothing errored. `Tools/build-kernels.sh`
-  now records `sn_block` / `sn_route_threads` next to each image (`target/hip/*.meta`) and
+  now records `sn_block` / `sn_route_threads` next to each image (`Engine/target/hip/*.meta`) and
   `KernelRegistry::add_image` refuses to load an image whose constants disagree with the Rust side.
   Passing the static footprint as a *dynamic* shared size was also wrong (it reserves a second 32 KB
   region); every route launch passes 0 — `decode::route_static_shared()` documents the footprint instead.
 
 ### 2.6 What Phase 4 is (files)
 
-* `crates/sn-core/src/oracle.rs` — the scalar twins, `nmse`/`max_abs`/`f16_rel`, `read_stage`, and the
+* `Engine/crates/sn-core/src/oracle.rs` — the scalar twins, `nmse`/`max_abs`/`f16_rel`, `read_stage`, and the
   single implementation of routing (`route_derive`, `mhc_route`, `mhc_merge`) that `forward.rs` now
   calls, so the reference and the kernels cannot drift apart.
-* `crates/sn-hip/kernels/phase4.hip` — the engine kernels + the `sn_ub_*` unfused baseline.
-* `crates/sn-hip/src/ops.rs` — `SPECS` (name, dtype, workgroup), `register_phase4`, `Kernels::resolve`,
+* `Engine/crates/sn-hip/kernels/phase4.hip` — the engine kernels + the `sn_ub_*` unfused baseline.
+* `Engine/crates/sn-hip/src/ops.rs` — `SPECS` (name, dtype, workgroup), `register_phase4`, `Kernels::resolve`,
   `grid1d`; `BLOCK = 256`, `ROUTE_BLOCK = 1024`.
-* `crates/sn-hip/src/decode.rs` — `compile()` → `ProgramSpec` (the op list of one decode step, with
+* `Engine/crates/sn-hip/src/decode.rs` — `compile()` → `ProgramSpec` (the op list of one decode step, with
   `Fusion` flags and the ladder), `Slots::reserve`, and the named *pending* kernels for Phase 5/6 so the
   counts above include kernels that do not exist yet.
-* `crates/sn-hip/src/check.rs` — `Harness`, `kernel_checks`, `route_vs_golden`, `fusion_gate`, `report`.
-* `crates/sn-cli/src/gpu.rs` — `sn gpu kernels`, `sn gpu route`, `sn bench fusion`, `sn hip ops`.
-* `crates/sn-hip/tests/{phase4.rs,phase4_fusion.rs,common/mod.rs}`, `Tools/kernel-check.py`.
+* `Engine/crates/sn-hip/src/check.rs` — `Harness`, `kernel_checks`, `route_vs_golden`, `fusion_gate`, `report`.
+* `Engine/crates/sn-cli/src/gpu.rs` — `sn gpu kernels`, `sn gpu route`, `sn bench fusion`, `sn hip ops`.
+* `Engine/crates/sn-hip/tests/{phase4.rs,phase4_fusion.rs,common/mod.rs}`, `Tools/kernel-check.py`.
 
 ---
 
@@ -334,10 +357,10 @@ than drifting.
 ### 3.0 The commands
 
 ```sh
-./Tools/build-kernels.sh                                 # crates/sn-hip/kernels/phase5.hip -> target/hip/phase5.fatbin
-./target/release/sn gpu gemm  --model $M                 # correctness of every shape in the checkpoint
-./target/release/sn bench gemm --model $M [--reps 10] [--trials 3] [--gemm-t 8,64,256,512] [--read-mb 256]
-cargo test -p sn-hip --test phase5                       # the same correctness gate as a test
+./Tools/build-kernels.sh                                 # Engine/crates/sn-hip/kernels/phase5.hip -> Engine/target/hip/phase5.fatbin
+Engine/target/release/sn gpu gemm  --model $M                 # correctness of every shape in the checkpoint
+Engine/target/release/sn bench gemm --model $M [--reps 10] [--trials 3] [--gemm-t 8,64,256,512] [--read-mb 256]
+(cd Engine && cargo test -p sn-hip --test phase5)       # the same correctness gate as a test
 ```
 
 `supernova` in the scratchpad sense: both commands read the **checkpoint's own weight bytes** into a
@@ -482,12 +505,12 @@ one shape and one geometry.
 
 ### 3.7 What Phase 5 is (files)
 
-* `crates/sn-hip/kernels/phase5.hip` — `sn_gemv_{q4_k,q6_k,f32}` (wide-load Q4_K, byte-load Q6_K,
+* `Engine/crates/sn-hip/kernels/phase5.hip` — `sn_gemv_{q4_k,q6_k,f32}` (wide-load Q4_K, byte-load Q6_K,
   folded-norm variant), `sn_gemm_{q4_k,q6_k,f32}` (64×64×32 tiled, shared-memory dequant), the
   `sn_read_bw` / `sn_peak_fma_f32` / `sn_peak_wmma` references, and the two debug probes.
-  `SN_GEMV_BLOCK 256` is recorded in `target/hip/phase5.meta` and `KernelRegistry::add_image`
+  `SN_GEMV_BLOCK 256` is recorded in `Engine/target/hip/phase5.meta` and `KernelRegistry::add_image`
   refuses an image whose value disagrees with `ops::GEMV_BLOCK` (the §2.5 guard, extended).
-* `crates/sn-hip/src/gemm.rs` — the shape table read out of the GGUF (`model_shapes`), the picks
+* `Engine/crates/sn-hip/src/gemm.rs` — the shape table read out of the GGUF (`model_shapes`), the picks
   (`pick_warps`, `pick_path`, `gemv_grid`), the correctness harness (`gemm_checks`, `f32_checks`),
   the bandwidth sweep and throughput tables, the gates and the report, the policy unit tests.
 * `decode.rs` no longer reports `gemv_q4_k` / `gemv_q6_k` / `gemv_f32` as pending: the decode step's
@@ -502,13 +525,13 @@ one shape and one geometry.
 The forward runs end-to-end on the device and is **the same function as the Phase 2 CPU reference**.
 
 ```
-./Tools/build-kernels.sh && ./target/release/sn run -m <model> --golden p1-capital -n 1 --ctx 8192 --ref-tokens 3
+./Tools/build-kernels.sh && Engine/target/release/sn run -m <model> --golden p1-capital -n 1 --ctx 8192 --ref-tokens 3
   golden p1-capital: engine top-1 11751 vs fork top-1 11751 -> MATCH
   logits vs Phase 2 reference at token 1: NMSE 3.157e-10 (gate 1e-4)
   logits vs Phase 2 reference at token 2: NMSE 3.160e-11
   logits vs Phase 2 reference at token 3: NMSE 5.961e-11
   GATE (logits): PASS
-./target/release/sn gpu phase6 --model <model>   -> 63 checks, 0 failing (worst 6.8e-14)
+Engine/target/release/sn gpu phase6 --model <model>   -> 63 checks, 0 failing (worst 6.8e-14)
 ```
 
 ### 4.1 `sn gpu stages`: the tool that found it
@@ -558,7 +581,7 @@ preset. No profiler, no rebuild, one command.
 
 ### 5.2 A decode step, before and after
 
-`./target/release/sn run -m <model> --golden p1-capital -n 0 --ctx 8192 --bench 30 [--drop …]`
+`Engine/target/release/sn run -m <model> --golden p1-capital -n 0 --ctx 8192 --bench 30 [--drop …]`
 
 | program | ms/token | t/s |
 |---|---|---|
@@ -590,7 +613,7 @@ while the *launch count* they save is 480 nodes. Two of them are actively harmfu
 
 ### 5.3 The current decode step
 
-`./target/release/sn run -m <model> --golden p1-capital -n 1 --ctx 8192`
+`Engine/target/release/sn run -m <model> --golden p1-capital -n 1 --ctx 8192`
 
 ```
 program: 986 ops per token (989 launches = 3 pinned copies + 986 kernels)
@@ -663,7 +686,7 @@ only named op-count item that is actually implementable as written.
 
 ### 6.1 The Q6_K repack: 210-byte super-blocks are a layout bug, not a format fact
 
-`crates/sn-core/src/dq.rs` now carries `Q6K_BLOCK_PADDED = 224` and `q6k_pad()`: the **device**
+`Engine/crates/sn-core/src/dq.rs` now carries `Q6K_BLOCK_PADDED = 224` and `q6k_pad()`: the **device**
 weight slab stores Q6_K super-blocks 224 bytes apart (16 × 14), fields at their wire offsets. The
 GGUF's own layout is untouched, and no re-encoding happens — 210 bytes are copied verbatim and 14
 bytes of zero follow, which is what lets `dq::q6k_dequant` stay the oracle for the repacked kernel.
@@ -675,7 +698,7 @@ That breaks the Phase 3 contract "tensor address = base + GGUF offset", so `Subs
 **The first version of this was silently wrong**: `driver::Engine::open`'s resolver handed
 `decode::compile` the GGUF offset, so every tensor after the first Q6_K one (which the file puts
 first, at offset 0) was read at the wrong address. It did not fault and it did not print an error —
-the head read shifted bytes and the logits came out NaN. `crates/sn-hip/tests/phase7.rs` asserts
+the head read shifted bytes and the logits came out NaN. `Engine/crates/sn-hip/tests/phase7.rs` asserts
 the property instead: every tensor resolves inside the slab, in non-overlapping ascending order, and
 `output_norm.weight` — the file's second tensor — must *not* keep its offset.
 
@@ -687,7 +710,7 @@ stride in the same change (its checks are what proved the stride change was comp
 ### 6.2 Measured: GEMV bandwidth, in the microbenchmark and in the graph
 
 ```
-./Tools/build-kernels.sh && ./target/release/sn bench gemm --model <model>   # Q6_K rows
+./Tools/build-kernels.sh && Engine/target/release/sn bench gemm --model <model>   # Q6_K rows
   read bandwidth   282.0 GB/s over 268435456 B
   output.weight        248320x4096 q6_k    217.9 GB/s   (was 101-114)
   attn_qkv_gate        12288x4096  q6_k   215.7
@@ -739,7 +762,7 @@ so one entry point cannot serve all three. `tests/phase5.rs` pins the arithmetic
 ### 6.4 The op count, honestly: 986 → 930, and why ≤ 300 is not reachable by fusion
 
 ```
-./target/release/sn hip ops --model <model> --ladder
+Engine/target/release/sn hip ops --model <model> --ladder
 raw (one kernel per step of §2):   971 launches ( 816 launchable today)
 + norm -> gemv:   859  ( 704)  -112        (measured *harmful*: +10.7 ms/token, §5.2)
 + silu -> gemv:   803  ( 648)  -56
@@ -769,7 +792,7 @@ slab *inside a loop over executions* — wasteful, and with `n_seq > 1` it was a
 resetting one sequence erased the others'.
 
 The Phase 6 gate ("`n_seq = 2` with divergent prefixes gives the same result as two separate runs")
-is now run through real forwards, in `crates/sn-hip/tests/phase7.rs`: one engine with two sequences
+is now run through real forwards, in `Engine/crates/sn-hip/tests/phase7.rs`: one engine with two sequences
 generates `p1-capital` and `p2-arithmetic`, the order is swapped after a `reset` of both, and the
 token streams are compared against a second single-sequence engine. Also asserted: `reset(0)` leaves
 `sessions().len(1)` alone, and the two prompts do not converge to one continuation (what a shared

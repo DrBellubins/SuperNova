@@ -4,7 +4,7 @@
 #   Tools/probe-branch.sh blk.0.ssm_out.weight blk.3.attn_output.weight ...
 set -e
 M=${MODEL:-/home/justin/Documents/AI/Models/SenseLoop/SenseNova-Loop-9B-Q4_K_M.gguf}
-SN=${SN:-./target/release/sn}
+SN=${SN:-Engine/target/release/sn}
 TOKENS=${TOKENS:-Docs/golden/tokens/p1-capital.ids}
 PROMPT=${PROMPT:-p1-capital}
 OUT=${OUT:-.abl}

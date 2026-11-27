@@ -1,7 +1,7 @@
 # SuperNova — SenseNova‑Loop‑9B inference engine: architecture findings & phased implementation plan
 
 Author: pi · Date: 2026‑11‑26 · Model: `SenseNova-Loop-9B-Q4_K_M.gguf` · Target: ROCm/HIP, **gfx1102** (RX 7700S, 8 GB)
-· **Phase 0 measured: `Docs/baseline.md`** · Phase 1 gates: `cargo test` + `Tools/plan-check.py`
+· **Phase 0 measured: `Docs/baseline.md`** · Phase 1 gates: `(cd Engine && cargo test)` + `Tools/plan-check.py`
 
 Reference implementations consulted (read‑only, **not copied**):
 `llama.cpp-opensensenova` @ `24ea7bb78` — commits `40de7782e` ("llama : add SenseNova Loop support"),
@@ -434,28 +434,53 @@ use f16 for activations/attention, q8_0 KV by default.
 **P4 — A scalar CPU reference always exists and is authoritative.** Every GPU kernel lands with a diff against
 Phase 2's reference tensors. No kernel is "done" until `NMSE ≤ 1e‑5` (1e‑6 for norms/routing) against the golden dump.
 
-### 6.1 Workspace layout
+### 6.1 Repository layout
+
+The cargo workspace lives in `Engine/`; the documentation and the golden corpus live in `Docs/` and
+the helper tools in `Tools/`, both at the repository root. This separation is deliberate: the corpus
+and the checkers are part of the *record* (a gate result is a command line against a frozen input,
+P8), not part of the build.
+
 ```
-src/
-  sn-core/      # no unsafe, no HIP: gguf reader, hparams, execution plan, tensor map, quant *decode* (scalar),
-                # tokenizer (GPT-2 BPE from GGUF vocab), reference forward (f32), golden dumps, samplers
-  sn-hip/       # #![deny(unsafe_op_in_unsafe_blocks)] device enum, allocator/arena, kernel registry,
-                # static decode program builder, HIP graph capture, error mapping
-  sn-engine/    # wires core+hip: model load, plan compile, prefill chunker, decode loop, caches, spec-decode driver
-  sn-cli/       # `sn run`, `sn dump`, `sn bench`, `sn ref`
-Tools/          # gguf_dump.py, roofline.py (+ future: dump-diff.py, golden-check.py, prof-parse.py)
-Docs/
+Engine/                       # the cargo workspace (`cargo` runs here, or via `cd Engine &&`)
+  Cargo.toml                  # workspace: members = crates/{sn-core,sn-hip,sn-cli}
+  crates/sn-core/             # no unsafe, no HIP: gguf reader, hparams, execution plan, tensor map,
+                              # quant decode (scalar) + the Q6_K device repack, reference forward (f32),
+                              # stage dumps, scalar oracles per kernel, `paths` (resource lookup)
+  crates/sn-hip/              # #![deny(unsafe_op_in_unsafe_fn)] device enum, slabs/arena, kernel
+                              # registry, static decode program builder, HIP graph capture, caches,
+                              # the decode fast path, greedy sampling in the program, the engine
+                              # driver (`Engine`/`EngineCfg`); kernels/ = the .hip sources
+  crates/sn-cli/              # `sn run|dump|ref|info|hip|gpu|bench`
+  target/hip/                 # build output: the fat binaries + .meta sidecars (gitignored)
+Tools/                        # build-kernels.sh, plan-check.py, roofline.py, golden-check.py,
+                              # kernel-check.py, dequant_ref.py, pyref.py, tok/detok/sn-oracle (C)
+Docs/                         # design-plan.md, bench.md, numerics.md, baseline.md, golden/ (frozen corpus)
 ```
-`cargo` only, no `cc`/`bindgen` for HIP (raw `hipcc`/`hip::device` via `build.rs` invoking `/opt/rocm/bin/hipcc`,
-link `libhipblas` only if we ever need it — plan is to not need it). `gfx1102` arch flag (`--offload-arch=gfx1102`;
-`gfx1103` is the same ISA family and works as a fallback, but build for what `rocminfo` reports). Target a static lib + CLI;
-no `main` in kernels. `unsafe` confined to `sn-hip`.
+
+There is no `sn-engine` crate: the model load / plan compile / prefill / decode wiring sits in
+`sn-hip::driver`, and the caches in `sn-hip::cache`. Splitting them out is a Phase 10 refactor.
+
+`cargo` only, no `cc`/`bindgen` for HIP (the `.hip` sources are compiled offline by
+`Tools/build-kernels.sh` and loaded with `hipModuleLoad`; `libhipblas` is linked only if we ever
+need it — plan is to not need it). `gfx1102` arch flag (`--offload-arch=gfx1102`; `gfx1103` is the
+same ISA family and works as a fallback, but build for what `rocminfo` reports). Target a static lib
++ CLI; no `main` in kernels. `unsafe` confined to `sn-hip`.
+
+Two consequences of the split, both enforced in code rather than in documentation:
+* the default locations of the two repository-relative resources — the kernel images
+  (`Engine/target/hip`) and the frozen corpus (`Docs/golden/expected.tsv`) — are resolved by
+  searching the working directory, its ancestors and the executable's directory
+  (`sn-core/src/paths.rs`), so the CLI works from the repo root and the tests work from the package
+  directory; explicit paths (`--model`, `--tokens-file`, `--expected`, `SN_KERNELS`) are used verbatim;
+* `Tools/build-kernels.sh` derives its own root from its path, so it can be invoked as
+  `./Tools/build-kernels.sh` from either directory.
 
 ---
 
 ## 7. Phases
 
-Each phase ends green: `cargo test` + a named acceptance gate. Phases 1‑6 build the *correct* engine;
+Each phase ends green: `(cd Engine && cargo test)` + a named acceptance gate. Phases 1‑6 build the *correct* engine;
 7‑9 make it *fast*; 10 makes it usable. Do not skip the gates — the later phases diff against earlier dumps.
 
 ### Phase 0 · Instrument the fork, freeze the targets (0.5 day) — **DONE 2026‑11‑26**
@@ -476,7 +501,7 @@ validity, the fork's validation rules (loop fits, mHC must not straddle a loop b
 `physical(0)=0, physical(4)=4, physical(27)=27, physical(28)=4, physical(51)=27, physical(52)=28, physical(55)=31`;
 test that `blk.52..55` resolve to physical 28..31; test rejection of an mHC range that straddles the loop.
 
-*Status:* `crates/sn-core/src/{gguf,plan,budget,qtypes,sys,error}.rs` + `crates/sn-cli` (`sn dump --plan
+*Status:* `Engine/crates/sn-core/src/{gguf,plan,budget,qtypes,sys,error}.rs` + `Engine/crates/sn-cli` (`sn dump --plan
 [--json]`, `sn dump --tensors`, `sn dump --meta`, `sn info`). Gate evidence: `cargo test` (5 lib + 7
 `tests/plan_gates.rs` + 1 `tests/real_model.rs`) green, and `python3 Tools/plan-check.py <model>` reports
 `OK: sn and roofline.py agree byte-for-byte on every tensor` (490 tensors, stored 5,807,658,496 B,
@@ -499,7 +524,7 @@ the original `≤ 1e‑4` is unreachable against a q8_0-operand oracle — see `
 Also emits `Docs/numerics.md` = §2 as tested code. **This phase is the one that de‑risks the whole project.**
 
 **Status (2026‑11‑26): code complete, one open numerics item, gate re‑specified against a measured
-floor.** Built: `crates/sn-core/src/{dq,num,forward}.rs`, `sn ref` (with `--dump`, `--dump-only`,
+floor.** Built: `Engine/crates/sn-core/src/{dq,num,forward}.rs`, `sn ref` (with `--dump`, `--dump-only`,
 `--limit-exec`, `--iters`, `--logits-out`, `--kv-f16`, `--f16-weights/--f16-acts`), `sn deq`,
 `Docs/golden/{corpus.json,tokens,ref,ref-cpu,embd,embd-cpu}` and
 `Tools/{golden-ref.py, golden-check.py, golden-embd.py, dequant_ref.py, stage-check.py, tok.c,
@@ -551,8 +576,8 @@ commands: **`Docs/bench.md` §1**. Summary:*
   dispatch against ~40 ms of weight traffic. The graph's win is host-side (6.5 µs total vs the fork's
   ~4 700 launches + 181 graph launches + 253 copies per token, `Docs/baseline.md` §2) plus pipelining
   (1.1–1.5×).
-* Built: `crates/sn-hip/src/{hip,arena,kernels,program,bench,lib}.rs`, `crates/sn-hip/kernels/phase3.hip`,
-    `Tools/build-kernels.sh` (`.hip` → `target/hip/*.fatbin`, loaded with `hipModuleLoad`; attribute enum
+* Built: `Engine/crates/sn-hip/src/{hip,arena,kernels,program,bench,lib}.rs`, `Engine/crates/sn-hip/kernels/phase3.hip`,
+    `Tools/build-kernels.sh` (`.hip` → `Engine/target/hip/*.fatbin`, loaded with `hipModuleLoad`; attribute enum
   values pinned by `Tools/hip_attrs.c`), `sn hip [info]`, `sn bench graph`. `Substrate` = exactly three
   device allocations (weights: one `hipMalloc` + one `hipMemcpy` of the GGUF data section, so a tensor's
   device address is `base + gguf_offset`; activations; caches) plus pinned host I/O. `SN_TRACE=ops|time`
@@ -616,7 +641,7 @@ fusion alone.** All numbers: `Docs/bench.md` §2.
   for the eight non-mHC blocks under `norm → gemv`. Counting ops could not see any of it, so the
   gate test now asserts the data-flow structure instead. Fixed before Phase 6, where they would have
   been numerics hunts.
-* Tooling worth keeping: `build-kernels.sh` now writes `target/hip/*.meta` and the loader **refuses** an
+* Tooling worth keeping: `build-kernels.sh` now writes `Engine/target/hip/*.meta` and the loader **refuses** an
   image whose `#define`d workgroup size disagrees with the Rust launch size — a mismatch silently read
   outside the reduction scratch and produced wrong router logits with no error anywhere.
 * **Deferred honestly:** the deliverable “`SN_TRACE` report before/after” is the launch-count ladder
@@ -639,9 +664,9 @@ NMSE ≤ 1e‑4 vs the scalar reference for all 12 GEMM shapes in the model.
 
 *Status (2026-11-27). Wording correction first: this checkpoint stores **Q4_K, Q6_K and f32** — there is no
 Q2_K (§1.2's census, and the heading said Q2_K). The kernels are `sn_gemv_{q4_k,q6_k,f32}` and
-`sn_gemm_{q4_k,q6_k,f32}` in `crates/sn-hip/kernels/phase5.hip`; `sn-hip/src/gemm.rs` holds the shape table read
+`sn_gemm_{q4_k,q6_k,f32}` in `Engine/crates/sn-hip/kernels/phase5.hip`; `Engine/crates/sn-hip/src/gemm.rs` holds the shape table read
 out of the GGUF, the picks, the gates and the report; `sn gpu gemm` / `sn bench gemm` run them;
-`crates/sn-hip/tests/phase5.rs` gates them.*
+`Engine/crates/sn-hip/tests/phase5.rs` gates them.*
 
 * **NMSE ≤ 1e-4 for all 12 shapes: PASS** — 47 checks, 0 failing, worst measured NMSE **4.12e-12** (f32 summation
  order and nothing else) against `sn-core::dq` over the checkpoint's own bytes. 12 shapes × type = 15 entries
@@ -676,16 +701,16 @@ out of the GGUF, the picks, the gates and the report; `sn gpu gemm` / `sn bench 
 
 ### Phase 6 · Caches, and the first correct GPU forward (4–6 days) — **CLOSED 2026-11-27: forward correct to 3e-10, golden top-1 matches the fork**
 
-*Status (2026-11-27, closed). Everything the phase asked for exists: `sn-hip/src/cache.rs` (`KvKind`
+*Status (2026-11-27, closed). Everything the phase asked for exists: `Engine/crates/sn-hip/src/cache.rs` (`KvKind`
 f16/q8_0/q4_0 with a quant-array-then-scales row; `CacheGeom`/`CacheLayout` reserving 14 KV + 42 GDN
 regions per sequence from `Plan`, sizes asserted against §3; `Sessions` with `check_pair`);
 `kernels/phase6.hip` (`sn_row_gather_q4_k`, `sn_qk_head_norm_f32`, `sn_kv_append`,
 `sn_attn_decode_f32`, `sn_gdn_conv_silu_f32`, `sn_gdn_l2norm_f32`, `sn_gdn_decode_f32`,
-`sn_gdn_gate_norm_f32`, `sn_gdn_snapshot`); an oracle twin for each in `sn-core::oracle`; `sn-hip/src/phase6.rs` +
-`sn gpu phase6`; `decode::compile_with_caches`; `sn-hip/src/driver.rs` (`Engine`: one program and one
+`sn_gdn_gate_norm_f32`, `sn_gdn_snapshot`); an oracle twin for each in `sn-core::oracle`; `Engine/crates/sn-hip/src/phase6.rs` +
+`sn gpu phase6`; `decode::compile_with_caches`; `Engine/crates/sn-hip/src/driver.rs` (`Engine`: one program and one
 captured graph per sequence, inputs through pinned memory); `sn run`; `Docs/golden/expected.tsv`.*
 
-* **Gate, measured** (`./Tools/build-kernels.sh && ./target/release/sn run -m <model> --golden p1-capital -n 1 --ctx 8192 --ref-tokens 3`):
+* **Gate, measured** (`./Tools/build-kernels.sh && Engine/target/release/sn run -m <model> --golden p1-capital -n 1 --ctx 8192 --ref-tokens 3`):
   logits NMSE vs the Phase 2 reference **3.2e-10 / 3.2e-11 / 6.0e-11 at tokens 1/2/3** (gate 1e-4) —
   **PASS**; engine top-1 = fork top-1 = **11751** for `p1-capital`, continuation
   `11751 13 561 6511 314`; `sn gpu phase6` **63 kernel checks, 0 failing** (worst 6.8e-14).
@@ -750,7 +775,7 @@ per token while making the forward worse. `launchable_fusion()` is now `Fusion::
   the Phase 5 gate, met. In-graph GEMV: **149 → 200 GB/s**; the token 62.9 → 51.7 ms. Cost: +131 MB
   and a `gguf offset → slab offset` map in `Substrate` (the "address = base + gguf offset" contract
   of §1.3 is deliberately broken; baking the GGUF offset instead was a silent NaN‑logits bug, now
-  asserted against in `crates/sn-hip/tests/phase7.rs`).
+  asserted against in `Engine/crates/sn-hip/tests/phase7.rs`).
 * **(b) done as far as it is possible.** `sn_gemv_q4_k_pair` batches `ffn_gate`+`ffn_up` (the only
   pair that is the same type and shape in every block): **56 fewer launches, 0.95 ms faster**, and
   `launchable_fusion()` is `RAW` with `multi_gemv` on. `q+k+v` **cannot** be one kernel — `attn_v`

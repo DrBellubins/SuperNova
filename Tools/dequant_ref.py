@@ -206,7 +206,7 @@ def main():
     ap.add_argument("--tensor", required=True)
     ap.add_argument("--rows", default="0")
     ap.add_argument("--check-sn", action="store_true", help="run `sn deq` and compare")
-    ap.add_argument("--sn", default="target/release/sn")
+    ap.add_argument("--sn", default="Engine/target/release/sn")
     ap.add_argument("--stats", action="store_true")
     args = ap.parse_args()
 

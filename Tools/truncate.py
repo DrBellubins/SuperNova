@@ -18,7 +18,7 @@ attention, and the MTP tensors (`blk.56.*`) are not part of any prefix.
 
 usage then:
     Tools/sn-oracle --model /tmp/prefix-12.gguf --layers "" --out /tmp/orc12 <tokens>   # result_norm + logits
-    target/debug/sn ref --model /tmp/prefix-12.gguf --tokens-file <tokens> --dump /tmp/sn12
+    Engine/target/debug/sn ref --model /tmp/prefix-12.gguf --tokens-file <tokens> --dump /tmp/sn12
 """
 import argparse
 import os

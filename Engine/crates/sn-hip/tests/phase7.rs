@@ -75,11 +75,11 @@ fn two_sequences_with_divergent_prefixes_agree_with_running_apart() {
         eprintln!("skip n_seq gate: no checkpoint (set SUPERNOVA_MODEL)");
         return;
     };
-    // `Engine::open` globs `target/hip` relative to the working directory; an integration test runs
-    // with the crate directory as its own, so point it at absolute paths.
+    // Pin the exact images this test was built against (`bench::image_dir()` finds
+    // Engine/target/hip from any working directory, but the skip reason must name the real paths).
     let imgs = images();
     if imgs.is_empty() {
-        eprintln!("skip n_seq gate: no kernel image under target/hip (run ./Tools/build-kernels.sh)");
+        eprintln!("skip n_seq gate: no kernel image under Engine/target/hip (run ./Tools/build-kernels.sh)");
         return;
     }
     unsafe { std::env::set_var("SN_KERNELS", imgs.join(":")) };
@@ -91,9 +91,14 @@ fn two_sequences_with_divergent_prefixes_agree_with_running_apart() {
             return;
         }
     };
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // `Docs/golden/` sits at the repository root, outside this workspace: resolve it by search
+    // (`sn_core::paths`) instead of counting `../` out of the package directory.
     let read = |id: &str| -> Vec<u32> {
-        let p = root.join(format!("Docs/golden/tokens/{id}.ids"));
+        let rel = format!("Docs/golden/tokens/{id}.ids");
+        let Some(p) = sn_core::paths::resolve_file(&rel) else {
+            eprintln!("skip n_seq gate: {rel} is not in this tree");
+            return Vec::new();
+        };
         match sn_hip::driver::read_ids(p.to_str().unwrap()) {
             Ok(v) => v,
             Err(e) => {

@@ -48,7 +48,7 @@ def main():
     ap.add_argument("--variants", default="", help="comma list of extra `sn ref` flag sets")
     ap.add_argument("--work", default="/dev/shm/poscheck")
     ap.add_argument("--oracle", default=os.path.join(HERE, "sn-oracle"))
-    ap.add_argument("--sn", default="target/release/sn")
+    ap.add_argument("--sn", default="Engine/target/release/sn")
     ap.add_argument("--quantised", action="store_true", help="skip def32 (keep quantised weights)")
     ap.add_argument("--keep", action="store_true", help="keep the generated model")
     args = ap.parse_args()

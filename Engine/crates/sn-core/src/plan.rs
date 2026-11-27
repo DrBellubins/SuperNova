@@ -594,7 +594,7 @@ fn validate(hp: &Hyperparams) -> Result<()> {
 }
 
 /// The checkpoint under development, expressed without a GGUF on disk. The same fixture
-/// `crates/sn-core/tests/plan_gates.rs` uses (values from SenseNova-Loop-9B-Q4_K_M.gguf, §1), and
+/// `Engine/crates/sn-core/tests/plan_gates.rs` uses (values from SenseNova-Loop-9B-Q4_K_M.gguf, §1), and
 /// `sn-hip`'s Phase 6 tests build cache layouts from it: a unit test should not need a 5.8 GB file
 /// to find out whether the index arithmetic is right.
 pub fn fixture_hyperparams() -> Hyperparams {

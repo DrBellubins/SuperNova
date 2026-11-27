@@ -24,7 +24,7 @@ use sn_hip::decode;
 fn with_phase5<T>(what: &str, f: impl FnOnce(&Substrate, &KernelRegistry) -> T) -> Option<T> {
     let imgs = images();
     if imgs.is_empty() {
-        eprintln!("skip {what}: no kernel image under target/hip (run ./Tools/build-kernels.sh)");
+        eprintln!("skip {what}: no kernel image under Engine/target/hip (run ./Tools/build-kernels.sh)");
         return None;
     }
     let sub = match Substrate::open() {

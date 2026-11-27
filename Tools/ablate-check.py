@@ -30,7 +30,7 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--prompt", default="p1-capital")
     ap.add_argument("--corpus", default="Docs/golden/corpus.json")
-    ap.add_argument("--sn", default="target/release/sn")
+    ap.add_argument("--sn", default="Engine/target/release/sn")
     ap.add_argument("--server", default="/home/justin/Documents/Github/llama.cpp-opensensenova/build/bin/llama-server")
     ap.add_argument("--port", type=int, default=8130)
     ap.add_argument("--cases", nargs="+", required=True,

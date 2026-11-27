@@ -13,14 +13,17 @@ set -euo pipefail
 
 ROCM=${ROCM:-/opt/rocm}
 HIPCC=${HIPCC:-$ROCM/bin/hipcc}
+# The cargo workspace is Engine/, so the images belong in Engine/target/hip whatever directory this
+# is called from (the engine finds them there by search - sn-hip/src/bench.rs::image_dir).
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OBJCOPY=${OBJCOPY:-}
 if [ -z "$OBJCOPY" ]; then
   for c in "$ROCM/lib/llvm/bin/llvm-objcopy" "$ROCM/bin/llvm-objcopy" "$(command -v llvm-objcopy || true)"; do
     if [ -n "$c" ] && [ -x "$c" ]; then OBJCOPY="$c"; break; fi
   done
 fi
-SRC=crates/sn-hip/kernels
-OUT=${OUT:-target/hip}
+SRC=${SRC:-$ROOT/Engine/crates/sn-hip/kernels}
+OUT=${OUT:-$ROOT/Engine/target/hip}
 
 [ -x "$HIPCC" ] || { echo "no hipcc at $HIPCC (set ROCM=/path/to/rocm)"; exit 1; }
 [ -x "$OBJCOPY" ] || { echo "no llvm-objcopy found (set OBJCOPY=...)"; exit 1; }
@@ -91,4 +94,4 @@ hipcc: $($HIPCC --version | head -1)
 isas: ${ISAS[*]}
 sources: $(ls "$SRC"/*.hip | tr '\n' ' ')
 EOF
-echo "kernel images in $OUT (SN_KERNELS=a:f overrides; default: every target/hip/*.fatbin)"
+echo "kernel images in $OUT (SN_KERNELS=a:f overrides; default: every Engine/target/hip/*.fatbin)"

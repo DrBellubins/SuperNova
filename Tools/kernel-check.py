@@ -45,7 +45,7 @@ def run(cmd, quiet=False):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     ap.add_argument("--model", default=DEF_MODEL)
-    ap.add_argument("--sn", default="target/release/sn")
+    ap.add_argument("--sn", default="Engine/target/release/sn")
     ap.add_argument("--prompt", default="p1-capital", help="id from Docs/golden/tokens/<id>.ids")
     ap.add_argument("--tokens", help="token id file (default Docs/golden/tokens/<prompt>.ids)")
     ap.add_argument("--dump", default="/tmp/sn-phase4-stages", help="stage dump directory")
@@ -59,9 +59,9 @@ def main():
 
     # The kernel image must exist too; `sn gpu route` refuses otherwise, but saying it here points
     # at the fix instead of at a HIP error.
-    images = [f for f in os.listdir("target/hip") if f.endswith(".fatbin")] if os.path.isdir("target/hip") else []
+    images = [f for f in os.listdir("Engine/target/hip") if f.endswith(".fatbin")] if os.path.isdir("Engine/target/hip") else []
     if not images:
-        sys.exit("no kernel images in target/hip: run ./Tools/build-kernels.sh (and keep its output visible)")
+        sys.exit("no kernel images in Engine/target/hip: run ./Tools/build-kernels.sh (and keep its output visible)")
 
     tokens = args.tokens or f"Docs/golden/tokens/{args.prompt}.ids"
     if not os.path.exists(tokens):

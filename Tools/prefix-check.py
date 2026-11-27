@@ -57,7 +57,7 @@ def main():
     ap.add_argument("--ks", default="5,8,12,16,20,24,28,52")
     ap.add_argument("--work", default="/dev/shm/prefix")
     ap.add_argument("--oracle", default=os.path.join(HERE, "sn-oracle"))
-    ap.add_argument("--sn", default="./target/release/sn")
+    ap.add_argument("--sn", default="Engine/target/release/sn")
     ap.add_argument("--keep-gguf", action="store_true")
     ap.add_argument("--sn-flags", default="", help="extra flags for `sn ref` (e.g. --attn-f16)")
     ap.add_argument("--all-tokens", action="store_true",

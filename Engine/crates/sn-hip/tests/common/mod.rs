@@ -10,8 +10,8 @@ use sn_hip::check;
 use sn_hip::kernels::KernelRegistry;
 use sn_hip::Substrate;
 
-/// Every kernel image, by absolute path: `bench::image_paths()` globs `target/hip` relative to the
-/// working directory, and integration tests run with the crate directory as theirs.
+/// Every kernel image, by absolute path. `bench::image_dir()` finds `Engine/target/hip` from any
+/// working directory; an integration test runs with the package directory as its own.
 pub fn images() -> Vec<String> {
     if let Ok(v) = std::env::var("SN_KERNELS") {
         let v: Vec<String> = v.split(':').map(|s| s.trim()).filter(|s| !s.is_empty()).map(String::from).collect();
@@ -19,7 +19,10 @@ pub fn images() -> Vec<String> {
             return v;
         }
     }
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/hip");
+    let dir = match sn_hip::bench::image_dir() {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
     let mut out: Vec<String> = std::fs::read_dir(&dir)
         .ok()
         .map(|rd| {

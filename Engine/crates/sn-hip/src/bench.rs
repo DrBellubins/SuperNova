@@ -24,9 +24,18 @@ use crate::Substrate;
 /// Where the kernel images live. `SN_KERNELS=a:f` overrides; the default is every image
 /// `Tools/build-kernels.sh` wrote, because from Phase 4 on the engine needs more than one
 /// (`phase3.fatbin` carries the graph probes, `phase4.fatbin` the elementwise and routing set).
+///
+/// The workspace is `Engine/`, so this is `Engine/target/hip` — reached by search, not by the
+/// working directory, so `sn` works from the repo root and cargo tests work from the package
+/// directory (`sn_core::paths`).
 pub const DEFAULT_DIR: &str = "target/hip";
 /// Only used to name a path in an error when the directory does not exist at all.
 pub const DEFAULT_IMAGE: &str = "target/hip/phase3.fatbin";
+
+/// The built image directory, wherever this process happens to be running from.
+pub fn image_dir() -> Option<std::path::PathBuf> {
+    sn_core::paths::resolve_dir(DEFAULT_DIR)
+}
 
 pub fn image_paths() -> Vec<String> {
     if let Ok(v) = std::env::var("SN_KERNELS") {
@@ -35,7 +44,11 @@ pub fn image_paths() -> Vec<String> {
             return v;
         }
     }
-    let mut out: Vec<String> = match std::fs::read_dir(DEFAULT_DIR) {
+    let dir = match image_dir() {
+        Some(d) => d,
+        None => return vec![DEFAULT_IMAGE.to_string()],
+    };
+    let mut out: Vec<String> = match std::fs::read_dir(&dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
             .map(|e| e.path())

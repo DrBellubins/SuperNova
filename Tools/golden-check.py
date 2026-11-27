@@ -86,7 +86,7 @@ def main():
     ap.add_argument("--corpus", default="Docs/golden/corpus.json")
     ap.add_argument("--ref-dir", default="Docs/golden/ref")
     ap.add_argument("--tokens-dir", default="Docs/golden/tokens")
-    ap.add_argument("--sn", default="target/release/sn")
+    ap.add_argument("--sn", default="Engine/target/release/sn")
     ap.add_argument("--model", default=DEF_MODEL)
     ap.add_argument("--work-dir", default="/tmp/sn-golden")
     ap.add_argument("--prompts", default="", help="comma-separated ids (default: all)")

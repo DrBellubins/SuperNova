@@ -10,6 +10,7 @@
 //! * [`budget`] — byte accounting per token and the "will it fit" check (Phase 1)
 //! * `numerics`, `forward` — the f32 reference forward (Phase 2)
 //! * [`oracle`] — scalar oracles for the fused HIP kernels, one per kernel (Phase 4)
+//! * [`paths`]  — finding `Docs/golden/**` and `target/hip/**` whatever directory the process runs from
 
 pub mod budget;
 pub mod dq;
@@ -18,6 +19,7 @@ pub mod forward;
 pub mod gguf;
 pub mod num;
 pub mod oracle;
+pub mod paths;
 pub mod plan;
 pub mod qtypes;
 pub mod sys;

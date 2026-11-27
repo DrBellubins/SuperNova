@@ -1,4 +1,4 @@
-//! Scalar oracles for the Phase 4 fused kernels (`crates/sn-hip/kernels/phase4.hip`).
+//! Scalar oracles for the Phase 4 fused kernels (`Engine/crates/sn-hip/kernels/phase4.hip`).
 //!
 //! Every kernel in Phase 4 has exactly one of these next to it, and every kernel test compares the
 //! two on identical inputs. That is design-plan §6 P4 ("a scalar CPU reference always exists and is
@@ -368,7 +368,7 @@ pub fn mhc_seed(cur: &[f32]) -> (Vec<f32>, Vec<f32>) {
 // ============================================================================================
 // Phase 6 oracles: the caches and the two recurrent inner loops.
 //
-// One per kernel in `crates/sn-hip/kernels/phase6.hip`, same operand order, so `sn gpu phase6`
+// One per kernel in `Engine/crates/sn-hip/kernels/phase6.hip`, same operand order, so `sn gpu phase6`
 // measures the thing the engine launches. `forward.rs` already contains this math inside the whole
 // model; these are the same formulas with the smallest possible context around them, because a
 // kernel-level failure has to point at one kernel.

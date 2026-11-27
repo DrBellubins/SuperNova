@@ -144,7 +144,7 @@ pub fn cmd_stages(positional: &[String], opt_val: &dyn Fn(&str) -> Option<String
     let deep: Option<usize> = opt_val("--deep").and_then(|v| v.parse().ok());
     let g = Gguf::open(&model)?;
     let plan = Plan::build(Hyperparams::from_gguf(&g)?)?;
-    let e = crate::run::read_expected(&opt_val("--expected").unwrap_or("Docs/golden/expected.tsv".into()), &gid)?;
+    let e = crate::run::read_expected(&crate::run::expected_path(opt_val("--expected")), &gid)?;
     let prompt = e.prompt.clone();
     let ntok = step.min(prompt.len());
 

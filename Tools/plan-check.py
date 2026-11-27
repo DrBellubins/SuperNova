@@ -6,7 +6,7 @@ element type), how many times it is streamed per decoded token, and the resultin
 agree only if the execution plan (loop expansion, first-visit GGUF block numbering, MTP exclusion)
 is understood identically. This script diffs them and fails on any disagreement.
 
-Usage: plan-check.py <model.gguf> [--sn target/debug/sn]
+Usage: plan-check.py <model.gguf> [--sn Engine/target/debug/sn]
 """
 import json
 import subprocess
@@ -22,7 +22,7 @@ def run(cmd):
 
 def main():
     model = sys.argv[1]
-    sn = "target/debug/sn"
+    sn = "Engine/target/debug/sn"
     if "--sn" in sys.argv:
         sn = sys.argv[sys.argv.index("--sn") + 1]
 

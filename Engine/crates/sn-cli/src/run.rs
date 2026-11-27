@@ -20,6 +20,21 @@ pub struct Expected {
     pub top8: Vec<(u32, f32)>,
 }
 
+/// The frozen corpus is kept at the repository root (`Docs/`), outside this workspace, so its
+/// default location is found by search rather than assumed to be under the working directory —
+/// `Engine/target/release/sn` and `cargo test` run from different directories. `--expected <path>`
+/// is always used verbatim; this only decides what happens when it is not given.
+pub const DEFAULT_EXPECTED: &str = "Docs/golden/expected.tsv";
+
+pub fn expected_path(explicit: Option<String>) -> String {
+    explicit.unwrap_or_else(|| {
+        sn_core::paths::resolve_file(DEFAULT_EXPECTED)
+            .map(|p| p.to_string_lossy().into_owned())
+            // Not in this tree: report the path the caller would have had to pass.
+            .unwrap_or_else(|| DEFAULT_EXPECTED.to_string())
+    })
+}
+
 pub fn read_expected(path: &str, id: &str) -> Result<Expected> {
     let text = std::fs::read_to_string(path)?;
     for line in text.lines() {
@@ -63,7 +78,7 @@ pub fn cmd_run(positional: &[String], opt_val: &dyn Fn(&str) -> Option<String>) 
     let plan = Plan::build(Hyperparams::from_gguf(&g)?)?;
 
     // ---- the prompt ---------------------------------------------------------------------
-    let expected_path = opt_val("--expected").unwrap_or("Docs/golden/expected.tsv".into());
+    let expected_path = expected_path(opt_val("--expected"));
     let mut expect: Option<Expected> = None;
     let prompt: Vec<u32> = if let Some(id) = &golden {
         let e = read_expected(&expected_path, id)?;

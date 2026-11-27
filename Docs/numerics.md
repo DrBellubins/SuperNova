@@ -2,7 +2,7 @@
 
 `Docs/design-plan.md` §2 states the math. This file states **how each rule in §2 is pinned by
 running code**, and **what the measured agreement is** between `sn ref` (this repository's scalar f32
-forward: `crates/sn-core/src/{num,dq,forward}.rs`) and the reference engine
+forward: `Engine/crates/sn-core/src/{num,dq,forward}.rs`) and the reference engine
 (`llama.cpp-opensensenova`, read-only). Phase 3+ diffs against these numbers, so anything here is a
 measurement with a command line behind it, not an assertion.
 
@@ -150,7 +150,7 @@ Results:
 ## 5. Phase 4: the same rules, now in HIP (2026‑11‑27)
 
 The kernels do not get their own numerics. They get the §1 rules, a scalar oracle in
-`sn-core/src/oracle.rs` that states each rule once, and a comparison of the two — plus a comparison
+`Engine/crates/sn-core/src/oracle.rs` that states each rule once, and a comparison of the two — plus a comparison
 against the Phase 2 dumps, because agreement with my own oracle proves only that the kernel implements
 *something* consistently.
 
@@ -191,6 +191,6 @@ against the Phase 2 dumps, because agreement with my own oracle proves only that
 * **A kernel can be wrong without any API noticing.** The reduction scratch of `sn_mhc_route_f32` is
   sized by a `#define` in the `.hip` while the workgroup size is chosen in Rust; with the two disagreeing
   the reduction reads outside its array and returns wrong logits for every row but the first — silently,
-  deterministically, and differently whenever the launch's `sharedBytes` changes. `target/hip/*.meta`
+  deterministically, and differently whenever the launch's `sharedBytes` changes. `Engine/target/hip/*.meta`
   (written by `Tools/build-kernels.sh`) and `KernelRegistry::add_image` (which refuses the mismatch) are
   the guard; `decode::route_static_shared()` documents why the dynamic shared size must be 0.

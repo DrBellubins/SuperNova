@@ -1,6 +1,6 @@
 //! Kernel images and the `(name, shape, dtype)` registry.
 //!
-//! Kernel *source* lives in `crates/sn-hip/kernels/*.hip`; it is compiled offline by
+//! Kernel *source* lives in `Engine/crates/sn-hip/kernels/*.hip`; it is compiled offline by
 //! `Tools/build-kernels.sh` into a fat binary and loaded here with `hipModuleLoad` - so the Rust
 //! build needs no HIP toolchain, and the ISA a kernel was built for is explicit and checkable.
 

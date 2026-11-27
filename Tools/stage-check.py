@@ -11,7 +11,7 @@ single-token passthrough and the recurrent state is empty, so the difference is 
 
   Tools/golden-embd.py --out-dir Docs/golden/embd        # GPU reference (f32 KV)
   Tools/golden-embd.py --ngl 0 --out-dir Docs/golden/embd-cpu   # CPU reference
-  target/release/sn ref ... --dump /tmp/hf --dump-only h_final
+  Engine/target/release/sn ref ... --dump /tmp/hf --dump-only h_final
   Tools/stage-check.py --ref Docs/golden/embd/p1-capital.json.gz --sn-dir /tmp/hf
   Tools/stage-check.py --ref A.json.gz --ref2 B.json.gz --sn-dir /tmp/hf   # A vs B = the noise floor
 
