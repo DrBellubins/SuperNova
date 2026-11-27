@@ -18,12 +18,15 @@
 
 pub mod arena;
 pub mod bench;
+pub mod cache;
 pub mod check;
 pub mod decode;
+pub mod driver;
 pub mod gemm;
 pub mod hip;
 pub mod kernels;
 pub mod ops;
+pub mod phase6;
 pub mod program;
 
 use std::ffi::c_void;
@@ -109,6 +112,29 @@ impl Slab {
 
     pub fn zero(&self, api: &HipApi) -> Result<()> {
         check("hipMemset", api.hipMemset.unwrap()(self.ptr, 0, self.len), api)
+    }
+
+    /// Device-to-host. The Phase 6 forward needs it (read the logits, read the sampled token);
+    /// until now every read-back lived privately inside the check harness.
+    pub fn read(&self, api: &HipApi, offset: usize, len: usize) -> Result<Vec<u8>> {
+        if offset + len > self.len {
+            return Err(Error::msg(format!(
+                "{}: reading {len} bytes at {offset} overruns a {} byte slab",
+                self.what, self.len
+            )));
+        }
+        let mut raw = vec![0u8; len];
+        check(
+            &format!("hipMemcpy({} read)", self.what),
+            api.hipMemcpy.unwrap()(
+                raw.as_mut_ptr() as *mut c_void,
+                (self.addr() + offset as u64) as *const c_void,
+                len,
+                hip::MEMCPY_DEVICE_TO_HOST,
+            ),
+            api,
+        )?;
+        Ok(raw)
     }
 
     pub fn write(&self, api: &HipApi, dst_offset: usize, src: &[u8]) -> Result<()> {

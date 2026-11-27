@@ -329,7 +329,7 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 ///           `mn = (scales[j+4] >> 4) | (scales[j] >> 6) << 4`.
 /// Value = `d*sc*q - dmin*mn`.
 #[inline]
-fn q4k_scale_min(scales: &[u8], j: usize) -> (u32, u32) {
+pub fn q4k_scale_min(scales: &[u8], j: usize) -> (u32, u32) {
     if j < 4 {
         ((scales[j] & 63) as u32, (scales[j + 4] & 63) as u32)
     } else {
@@ -340,7 +340,7 @@ fn q4k_scale_min(scales: &[u8], j: usize) -> (u32, u32) {
     }
 }
 
-fn q4k_dequant(blk: &[u8], out: &mut [f32]) {
+pub fn q4k_dequant(blk: &[u8], out: &mut [f32]) {
     let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
     let dm = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
     let scales = &blk[4..16];

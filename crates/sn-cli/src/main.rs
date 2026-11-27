@@ -84,6 +84,7 @@ fn run(argv: &[String]) -> sn_core::Result<String> {
             }
         }
         Some("ref") => cmd_ref(argv, &positional, opt_val, flag),
+        Some("run") => run::cmd_run(&positional, &opt_val),
         Some("hip") => hip::cmd_hip(&positional, opt_val, flag),
         Some("gpu") => cmd_gpu(&positional, &opt_val),
         Some("bench") => hip::cmd_bench(&positional, opt_val),
@@ -275,9 +276,11 @@ fn cmd_gpu(positional: &[String], opt_val: &impl Fn(&str) -> Option<String>) -> 
         Some("kernels") => gpu::cmd_kernels(opt_val),
         Some("route") => gpu::cmd_route(positional, opt_val),
         Some("gemm") => gpu::cmd_gemm(opt_val, false),
+        Some("phase6") => gpu::cmd_phase6(opt_val),
         _ => Ok("sn gpu kernels
 sn gpu route --model <gguf> --dump <dir> [--execs 4-11]
 sn gpu gemm  --model <gguf>
+sn gpu phase6 --model <gguf>
 ".into()),
     }
 }
@@ -667,4 +670,5 @@ fn json_nums<T: std::fmt::Display>(v: &[T]) -> String {
 }
 
 mod gpu;
+mod run;
 mod hip;

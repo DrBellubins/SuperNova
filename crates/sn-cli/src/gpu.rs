@@ -241,7 +241,7 @@ pub fn cmd_ops(
     let mut act = sn_hip::arena::Arena::new("decode-activations");
     let (slots, bytes) = decode::Slots::reserve(&mut act, &plan, n_ctx)?;
     act.freeze();
-    let bases = Bases { activations: 0x1_0000_0000, weights: 0x8_0000_0000 }; // illustrative, never launched
+    let bases = Bases { activations: 0x1_0000_0000, weights: 0x8_0000_0000, ..Default::default() }; // illustrative, never launched
     let resolve = |name: &str| -> sn_core::Result<(u64, String)> {
         let t = g.tensor(name)?;
         Ok((t.offset, sn_core::qtypes::name(t.ty).to_string()))
@@ -291,4 +291,32 @@ pub fn cmd_ops(
 
 fn trunk(plan: &Plan) -> usize {
     (0..plan.n_exec()).filter(|&il| plan.exec(il).mtp == 0).count()
+}
+
+/// `sn gpu phase6`: every Phase 6 kernel against its scalar oracle, on the checkpoint's geometry.
+pub fn cmd_phase6(opt_val: &dyn Fn(&str) -> Option<String>) -> Result<String> {
+    let path = opt_val("--model").ok_or_else(|| sn_core::Error::msg("phase6 needs --model <gguf>"))?;
+    let g = Gguf::open(&path)?;
+    let plan = Plan::build(Hyperparams::from_gguf(&g)?)?;
+    let mut sub = Substrate::open()?;
+    let mut reg = KernelRegistry::new();
+    for p in sn_hip::bench::image_paths() {
+        reg.add_image(&sub.dev, &p)?;
+    }
+    let n4 = sn_hip::ops::register_phase4(&sub.dev, &mut reg)?;
+    let n5 = sn_hip::gemm::register_phase5(&sub.dev, &mut reg)?;
+    let n6 = sn_hip::phase6::register_phase6(&sub.dev, &mut reg)?;
+    let p6 = sn_hip::phase6::Phase6::resolve(&reg)?;
+    let mut h = check::Harness::open(&mut sub, &mut reg)?;
+    let checks = sn_hip::phase6::phase6_checks(&p6, &mut h, &plan.hp.dims, plan.hp.d_conv, plan.hp.rms_eps)?;
+    let failing: Vec<&Check> = checks.iter().filter(|c| !c.ok()).collect();
+    let mut out = format!("{}\n", sub.dev.info);
+    out += &format!("model: {path}\n{} Phase 4 + {} Phase 5 + {} Phase 6 kernels registered\n", n4, n5, n6);
+    out += "Phase 6 kernels vs sn_core::oracle (deterministic inputs, real geometry)\n";
+    out += &check::report(&checks);
+    out += &format!("\nGATE: {} ({} checks, {} failing)\n", if failing.is_empty() { "PASS" } else { "FAIL" }, checks.len(), failing.len());
+    for c in &failing {
+        out += &format!("  {} NMSE {:.3e} > {:.0e}\n", c.name, c.nmse, c.gate);
+    }
+    Ok(out)
 }

@@ -592,3 +592,68 @@ fn validate(hp: &Hyperparams) -> Result<()> {
     }
     Ok(())
 }
+
+/// The checkpoint under development, expressed without a GGUF on disk. The same fixture
+/// `crates/sn-core/tests/plan_gates.rs` uses (values from SenseNova-Loop-9B-Q4_K_M.gguf, §1), and
+/// `sn-hip`'s Phase 6 tests build cache layouts from it: a unit test should not need a 5.8 GB file
+/// to find out whether the index arithmetic is right.
+pub fn fixture_hyperparams() -> Hyperparams {
+    let n_layer_all = 57;
+    let is_recr = (0..n_layer_all).map(|i| (i + 1) % 4 != 0 && i != 56).collect();
+    let mut hp = Hyperparams {
+        arch: "sensenova_loop".into(),
+        name: "fixture".into(),
+        quant_label: "Q4_K_M".into(),
+        n_layer_all,
+        n_layer_nextn: 1,
+        n_embd: 4096,
+        n_ffn: 12288,
+        n_head: 16,
+        n_head_kv: 4,
+        head_dim: 256,
+        n_rot: 64,
+        rms_eps: 1e-6,
+        vocab: 248320,
+        ctx_train: 524288,
+        rope_base: 1e7,
+        rope_type: "yarn".into(),
+        yarn_factor: 2.0,
+        ctx_orig: 262144,
+        rope_sections: vec![11, 11, 10, 0],
+        d_conv: 4,
+        d_state: 128,
+        n_group: 16,
+        dt_rank: 32,
+        d_inner: 4096,
+        loop_start: 4,
+        loop_end: 28,
+        loop_count: 2,
+        mhc_start: 4,
+        mhc_end: 28,
+        mhc_streams: 2,
+        mhc_iters: 20,
+        mhc_pre_scale: 1.0,
+        mhc_fixed_identity: false,
+        is_recr,
+        dims: Dims {
+            n_q: 0,
+            n_kv: 0,
+            attn_n_q_heads: 0,
+            attn_n_kv_heads: 0,
+            attn_d_head: 0,
+            n_k_heads: 0,
+            n_v_heads: 0,
+            d_k: 0,
+            d_v: 0,
+            qkv_width: 0,
+            hc_width: 0,
+            n_route: 0,
+        },
+    };
+    hp.dims = hp.compute_dims();
+    hp
+}
+
+pub fn fixture_plan() -> Result<Plan> {
+    Plan::build(fixture_hyperparams())
+}

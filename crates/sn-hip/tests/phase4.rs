@@ -114,7 +114,7 @@ fn phase4_decode_step_op_counts_are_recorded() {
     let mut act = sn_hip::arena::Arena::new("decode-activations");
     let (slots, bytes) = decode::Slots::reserve(&mut act, &plan, 8192).expect("arena reserved");
     act.freeze();
-    let bases = Bases { activations: 0x1_0000_0000, weights: 0x8_0000_0000 }; // never launched
+    let bases = Bases { activations: 0x1_0000_0000, weights: 0x8_0000_0000, ..Default::default() }; // never launched
     let resolve = |name: &str| -> sn_core::Result<(u64, String)> {
         let t = g.tensor(name)?;
         Ok((t.offset, sn_core::qtypes::name(t.ty).to_string()))

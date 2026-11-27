@@ -27,6 +27,7 @@ use sn_core::error::{Error, Result};
 use sn_core::plan::Plan;
 
 use crate::arena::Arena;
+use crate::cache::{CacheLayout, KvKind, META_LEN};
 use crate::kernels::{DType, KernelRegistry};
 use crate::ops::{grid1d, BLOCK};
 use crate::program::{Arg, ProgramBuilder};
@@ -129,8 +130,9 @@ pub struct ProgramSpec {
     pub ops: Vec<OpSpec>,
     /// Pinned-host -> device copies the program starts with. These are `Op::H2DPinned` nodes, not
     /// kernels, and they are the only host writes in a decode step (P1's "write a token id and a
-    /// position, launch one graph").
-    pub inputs: Vec<(String, u64, usize)>,
+    /// position, launch one graph"). `(label, device address, pinned host address, length)`; a host
+    /// address of 0 means the program was compiled for counting only and cannot be launched.
+    pub inputs: Vec<(String, u64, u64, usize)>,
     pub fusion: Fusion,
     /// Bytes of activation arena the program addresses, i.e. the arena `Slots` reserved.
     pub arena_bytes: usize,
@@ -184,10 +186,21 @@ impl ProgramSpec {
         s
     }
 
-    /// Append the launchable ops to a [`ProgramBuilder`]. Pending kernels are skipped unless
-    /// `strict`, which is what Phase 7 will use to prove the program is complete.
+    /// Append the pinned input copies and the launchable ops to a [`ProgramBuilder`]. Pending
+    /// kernels are skipped unless `strict`, which is what Phase 7 will use to prove the program is
+    /// complete. The input copies come first: they are how a token id, a position and a cache
+    /// length reach a program that is never rebuilt (P1).
     pub fn build<'b>(&self, reg: &KernelRegistry, b: &mut ProgramBuilder<'b>, strict: bool) -> Result<usize> {
         let mut n = 0;
+        for (label, dst, host, len) in &self.inputs {
+            if *host == 0 {
+                if strict {
+                    return Err(Error::msg(format!("{label}: compiled without a pinned host base, cannot launch")));
+                }
+                continue;
+            }
+            b.h2d_pinned(label, *dst, *host, *len);
+        }
         for o in &self.ops {
             let k = reg
                 .find(&o.kernel, &[], DType::F32)
@@ -287,11 +300,42 @@ impl Slots {
 }
 
 /// The bases a compiled program bakes into its pointers.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Bases {
     pub activations: u64,
     pub weights: u64,
+    /// The cache slab (`Substrate::caches`), or 0 when the program has no caches.
+    pub caches: u64,
+    /// The pinned host slot, or 0 when the program is only being counted.
+    pub pinned: u64,
 }
+
+/// Which cached state a compiled step belongs to. Every cache address the program bakes is
+/// `caches + CacheLayout::...`, so a second sequence is a second `compile`, not a graph update.
+#[derive(Clone, Copy, Debug)]
+pub struct CacheArgs<'a> {
+    pub layout: &'a CacheLayout,
+    pub seq: usize,
+    pub kind: KvKind,
+}
+
+impl CacheArgs<'_> {
+    fn kind_code(&self) -> usize {
+        match self.kind {
+            KvKind::F16 => 0,
+            KvKind::Q8_0 => 1,
+            KvKind::Q4_0 => 2,
+        }
+    }
+}
+
+/// The pinned host slot layout. One block, one H2D copy per step: the token id, the position, and
+/// the per-sequence meta rows (`cache::Sessions::meta_bytes`), which is where the attention kernel
+/// reads the current cache length from. A captured graph takes new inputs without being rebuilt.
+pub const PIN_POS: usize = 0;
+pub const PIN_TOKEN: usize = 4;
+pub const PIN_META: usize = 256;
+pub const PIN_BYTES: usize = 4096;
 
 /// Shared memory `sn_mhc_route_f32` needs: the wavefront partials, the 8 x workgroup reduction
 /// scratch, and the eight finals. Matches the `__shared__` declarations in `kernels/phase4.hip`.
@@ -326,12 +370,40 @@ pub fn compile(
     fusion: Fusion,
     weights: &dyn Fn(&str) -> Result<(u64, String)>,
 ) -> Result<ProgramSpec> {
+    compile_inner(plan, slots, bases, arena_bytes, fusion, weights, None)
+}
+
+/// The Phase 6 form: the same walk, with the caches of one sequence resolved, so the recurrent
+/// kernels (`kv_append`, `attn_decode`, the GDN set) and the embedding gather are real launches
+/// rather than names in a count.
+pub fn compile_with_caches(
+    plan: &Plan,
+    slots: &Slots,
+    bases: Bases,
+    arena_bytes: usize,
+    fusion: Fusion,
+    weights: &dyn Fn(&str) -> Result<(u64, String)>,
+    cache: &CacheArgs,
+) -> Result<ProgramSpec> {
+    compile_inner(plan, slots, bases, arena_bytes, fusion, weights, Some(cache))
+}
+
+fn compile_inner(
+    plan: &Plan,
+    slots: &Slots,
+    bases: Bases,
+    arena_bytes: usize,
+    fusion: Fusion,
+    weights: &dyn Fn(&str) -> Result<(u64, String)>,
+    cache: Option<&CacheArgs>,
+) -> Result<ProgramSpec> {
     let hp = &plan.hp;
     let dm = &hp.dims;
     let d = hp.n_embd;
     let mut b = Builder {
         ops: Vec::new(),
         inputs: Vec::new(),
+        cache,
         bases,
         slots: slots.clone(),
         fusion,
@@ -347,18 +419,31 @@ pub fn compile(
     // ---- input staging --------------------------------------------------------------
     // The token id and the position arrive in pinned host memory; the graph's first two nodes copy
     // them into the arena. No hipMemcpy in the loop, no allocation, no graph update (P1).
-    b.input("input:pos", slots.pos, 4);
-    b.input("input:token", slots.token, 4);
+    // The device side of each copy is the arena slot the kernels read; the host side is the pinned
+    // slot. Writing to `activations + PIN_POS` instead of `activations + slots.pos` is the kind of
+    // mistake that shows up as a garbage embedding row, not an error.
+    b.input_from("input:pos", PIN_POS, slots.pos, 4);
+    b.input_from("input:token", PIN_TOKEN, slots.token, 4);
+    if let Some(c) = cache {
+        // The per-sequence meta rows, including the current cache length the attention kernels read.
+        // One node for every sequence, so a multi-sequence engine still has one host write.
+        let n_seq = c.layout.geom.as_ref().map(|g| g.n_seq).unwrap_or(1);
+        b.input_to("input:seq_meta", PIN_META, bases.caches + c.layout.meta as u64, n_seq * 16);
+    }
 
     // ---- embedding ------------------------------------------------------------------
     // One row of a quantised table, gathered rather than multiplied against a one-hot vector.
     let (emb_off, emb_ty) = weights("token_embd.weight")?;
+    // Phase 6 has the gather for the type this checkpoint stores; anything else stays an honest
+    // pending name rather than a wrong-typed launch.
+    let have_gather = cache.is_some() && emb_ty == "q4_k";
+    let gather_name = if have_gather { "sn_row_gather_q4_k".to_string() } else { format!("row_gather_{emb_ty}") };
     b.push(
         "embd row",
         "input",
-        &format!("row_gather_{emb_ty}"),
-        true,
-        grid1d(d),
+        &gather_name,
+        !have_gather,
+        [1, 1, 1],
         BLOCK,
         0,
         vec![b.w_off(emb_off), b.a(slots.token), b.a(slots.cur), i(d)],
@@ -433,42 +518,66 @@ pub fn compile(
                 vec![b.a(slots.ba), b.a(slots.ba), u(dm.n_v_heads)],
             );
             // The GDN recurrent kernels are Phase 6's; named, counted, reported pending.
+            let g = b.gdn_opt(il);
+            let (state_ptr, conv_ptr) = match g {
+                Some((st, cv)) => (Some(b.ca_off(st)), Some(b.ca_off(cv))),
+                None => (None, None),
+            };
+            let have_gdn = g.is_some();
             b.push(
                 &format!("gdn conv blk.{blk}"),
                 "recur",
-                "gdn_conv_silu",
-                true,
-                grid1d(dm.qkv_width),
+                if have_gdn { "sn_gdn_conv_silu_f32" } else { "gdn_conv_silu" },
+                !have_gdn,
+                [((dm.qkv_width / BLOCK as usize) as u32).max(1), 1, 1],
                 BLOCK,
                 0,
-                vec![b.a(slots.qkvz), b.w(&t("ssm_conv1d.weight"))?, b.a(slots.conv_out), i(dm.qkv_width), i(hp.d_conv)],
+                vec![
+                    b.a(slots.qkvz),
+                    b.w(&t("ssm_conv1d.weight"))?,
+                    b.a(slots.conv_out),
+                    match conv_ptr { Some(p) => p, None => Arg::U64(0) },
+                    i(dm.qkv_width),
+                    i(hp.d_conv),
+                ],
             );
             b.push(
                 &format!("gdn l2norm blk.{blk}"),
                 "recur",
-                "gdn_l2norm",
-                true,
-                [dm.n_k_heads as u32, 1, 1],
-                dm.d_k as u32,
+                if have_gdn { "sn_gdn_l2norm_f32" } else { "gdn_l2norm" },
+                !have_gdn,
+                [2 * dm.n_k_heads as u32, 1, 1],
+                BLOCK,
                 0,
-                vec![b.a(slots.conv_out), b.a(slots.conv_out), i(dm.n_k_heads), i(dm.d_k), Arg::F32(hp.rms_eps)],
+                vec![b.a(slots.conv_out), b.a(slots.conv_out), i(dm.d_k), Arg::F32(hp.rms_eps)],
             );
             b.push(
                 &format!("gdn step blk.{blk}"),
                 "recur",
-                "gdn_decode",
-                true,
+                if have_gdn { "sn_gdn_decode_f32" } else { "gdn_decode" },
+                !have_gdn,
                 [dm.n_v_heads as u32, 1, 1],
-                BLOCK,
+                crate::phase6::GDN_DECODE_BLOCK,
                 0,
-                vec![b.a(slots.conv_out), b.a(slots.ba), b.a(slots.gdn_core), Arg::U64(0), i(dm.n_v_heads), i(dm.d_v), i(dm.d_k)],
+                vec![
+                    b.a(slots.conv_out),
+                    b.a(slots.ba),
+                    b.w(&t("ssm_a"))?,
+                    b.w(&t("ssm_dt.bias"))?,
+                    match state_ptr { Some(p) => p, None => Arg::U64(0) },
+                    b.a(slots.gdn_core),
+                    i(dm.n_v_heads),
+                    i(dm.d_v),
+                    i(dm.d_k),
+                    i(dm.n_k_heads),
+                ],
             );
             // out = (rms(core) * ssm_norm) * silu(z): one fused gated norm (§2.4).
             b.push(
                 &format!("gdn gate_norm blk.{blk}"),
                 "gate",
-                "gdn_gate_norm",
-                true,
+                if have_gdn { "sn_gdn_gate_norm_f32" } else { "gdn_gate_norm" },
+                !have_gdn,
                 grid1d(dm.n_v_heads * dm.d_v),
                 BLOCK,
                 0,
@@ -536,6 +645,31 @@ pub fn compile(
                     )?;
                 }
             }
+            // Per-head Q/K norm with `attn_q_norm` / `attn_k_norm`, before rope (§2.3). The Phase 4
+            // count never emitted this; the reference forward does, and a missing norm is exactly the
+            // kind of silent gap the structural assertions below exist to catch.
+            if b.cache.is_some() {
+                b.push(
+                    &format!("qk head norm blk.{blk}"),
+                    "norm",
+                    "sn_qk_head_norm_f32",
+                    false,
+                    [dm.attn_n_q_heads as u32 + dm.attn_n_kv_heads as u32, 1, 1],
+                    BLOCK,
+                    0,
+                    vec![
+                        b.a(slots.qg),
+                        b.w(&t("attn_q_norm.weight"))?,
+                        b.a(slots.k),
+                        b.w(&t("attn_k_norm.weight"))?,
+                        i(dm.attn_n_q_heads),
+                        i(dm.attn_n_kv_heads),
+                        i(dm.attn_d_head),
+                        i(2 * dm.attn_d_head),
+                        Arg::F32(hp.rms_eps),
+                    ],
+                );
+            }
             // rope: q and k are different buffers, so two launches (16 + 4 heads).
             if !b.fusion.rope_into_gemv {
                 let pairing = if hp.arch == "sensenova_loop" { 1 } else { 0 };
@@ -565,31 +699,57 @@ pub fn compile(
                     );
                 }
             }
+            let g = b.kv_opt(il);
+            let have_kv = g.is_some();
+            let (kv_ptr, row_bytes, kind_code) = match g {
+                Some(kv) => (Some(b.ca_off(kv)), b.kv_row_bytes(), b.cache.unwrap().kind_code()),
+                None => (None, 0, 0),
+            };
+            let values = dm.n_kv;
+            let len_arg = b.len_arg();
             b.push(
                 &format!("kv append blk.{blk}"),
                 "recur",
-                "kv_append_f16",
-                true,
-                grid1d(dm.n_kv),
+                if have_kv { "sn_kv_append" } else { "kv_append_f16" },
+                !have_kv,
+                [1, 1, 1],
                 BLOCK,
                 0,
-                vec![b.a(slots.k), b.a(slots.v), Arg::U64(0), i(dm.n_kv), i(dm.attn_d_head)],
+                vec![
+                    b.a(slots.k),
+                    b.a(slots.v),
+                    match kv_ptr { Some(p) => p, None => Arg::U64(0) },
+                    // The row this token writes is `*len_ptr - 1`: the meta copy above carries the
+                    // length *after* this append, which is also what attention reads. Keeping the
+                    // index on the device is what makes one captured graph serve every token.
+                    len_arg,
+                    i(values),
+                    i(row_bytes),
+                    i(2 * row_bytes),
+                    i(kind_code),
+                ],
             );
             b.push(
                 &format!("attn decode blk.{blk}"),
                 "recur",
-                "attn_decode_f16",
-                true,
+                if have_kv { "sn_attn_decode_f32" } else { "attn_decode_f16" },
+                !have_kv,
                 [dm.attn_n_q_heads as u32, 1, 1],
-                BLOCK,
+                crate::phase6::ATTN_BLOCK,
                 0,
                 vec![
                     b.a(slots.qg),
-                    Arg::U64(0),
+                    match kv_ptr { Some(p) => p, None => Arg::U64(0) },
                     b.a(slots.attn_out),
+                    len_arg,
                     i(dm.attn_n_q_heads),
                     i(dm.attn_n_kv_heads),
                     i(dm.attn_d_head),
+                    i(2 * dm.attn_d_head),
+                    i(values),
+                    i(row_bytes),
+                    i(2 * row_bytes),
+                    i(kind_code),
                     Arg::F32(1.0 / (dm.attn_d_head as f32).sqrt()),
                 ],
             );
@@ -695,7 +855,8 @@ pub fn compile(
 /// stay happy: `push` is the only place an `OpSpec` is created.
 struct Builder<'a> {
     ops: Vec<OpSpec>,
-    inputs: Vec<(String, u64, usize)>,
+    inputs: Vec<(String, u64, u64, usize)>,
+    cache: Option<&'a CacheArgs<'a>>,
     bases: Bases,
     slots: Slots,
     fusion: Fusion,
@@ -721,8 +882,58 @@ impl<'a> Builder<'a> {
     fn w_off(&self, off: u64) -> Arg {
         Arg::Ptr(self.bases.weights + off)
     }
-    fn input(&mut self, label: &str, off: usize, len: usize) {
-        self.inputs.push((label.to_string(), self.bases.activations + off as u64, len));
+    fn input_from(&mut self, label: &str, pin_off: usize, act_off: usize, len: usize) {
+        self.input_to(label, pin_off, self.bases.activations + act_off as u64, len);
+    }
+
+    fn input_to(&mut self, label: &str, pin_off: usize, dst: u64, len: usize) {
+        let host = if self.bases.pinned == 0 { 0 } else { self.bases.pinned + pin_off as u64 };
+        self.inputs.push((label.to_string(), dst, host, len));
+    }
+
+    /// The device address a kernel should read the sequence length from, or a null pointer for a
+    /// program that was only compiled for counting. Resolved before `push`, because the argument
+    /// list is an argument of `push`.
+    fn len_arg(&self) -> Arg {
+        match self.kv_len_ptr() {
+            Ok(p) => Arg::Ptr(p),
+            Err(_) => Arg::U64(0),
+        }
+    }
+
+    fn ca_off(&self, off: u64) -> Arg {
+        Arg::Ptr(self.bases.caches + off)
+    }
+
+    /// The KV region for this execution, or `None` for a GDN execution (which has no KV cache) and
+    /// for a program compiled without caches.
+    fn kv_opt(&self, exec: usize) -> Option<u64> {
+        let c = self.cache?;
+        if !c.layout.kv_exec.contains(&exec) {
+            return None;
+        }
+        c.layout.kv(exec, c.seq).ok().map(|o| o as u64)
+    }
+
+    /// The GDN state and conv regions for this execution, or `None` for an attention execution.
+    fn gdn_opt(&self, exec: usize) -> Option<(u64, u64)> {
+        let c = self.cache?;
+        if !c.layout.gdn_exec.contains(&exec) {
+            return None;
+        }
+        Some((c.layout.state(exec, c.seq).ok()? as u64, c.layout.conv(exec, c.seq).ok()? as u64))
+    }
+
+    fn kv_row_bytes(&self) -> usize {
+        self.cache.map(|c| c.layout.kv_row_bytes().unwrap_or(0)).unwrap_or(0)
+    }
+
+    fn kv_len_ptr(&self) -> Result<u64> {
+        let c = match self.cache {
+            Some(c) => c,
+            None => return Err(Error::msg("this program was compiled without caches")),
+        };
+        Ok(self.bases.caches + (c.layout.meta_row(c.seq)? + META_LEN * 4) as u64)
     }
     #[allow(clippy::too_many_arguments)]
     fn push(&mut self, label: &str, class: &'static str, kernel: &str, pending: bool, grid: [u32; 3], block: u32, shared: u32, args: Vec<Arg>) {

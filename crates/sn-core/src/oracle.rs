@@ -365,6 +365,250 @@ pub fn mhc_seed(cur: &[f32]) -> (Vec<f32>, Vec<f32>) {
     (cur.to_vec(), cur.to_vec())
 }
 
+// ============================================================================================
+// Phase 6 oracles: the caches and the two recurrent inner loops.
+//
+// One per kernel in `crates/sn-hip/kernels/phase6.hip`, same operand order, so `sn gpu phase6`
+// measures the thing the engine launches. `forward.rs` already contains this math inside the whole
+// model; these are the same formulas with the smallest possible context around them, because a
+// kernel-level failure has to point at one kernel.
+// ============================================================================================
+
+/// One row of a Q4_K matrix (the embedding table's type), via the same field walk `dq` uses.
+pub fn row_gather_q4k(bytes: &[u8], k: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; k];
+    for b in 0..k / 256 {
+        crate::dq::q4k_dequant(&bytes[b * 144..b * 144 + 144], &mut out[b * 256..b * 256 + 256]);
+    }
+    out
+}
+
+/// Per-head Q/K RMS norm with the checkpoint's gains (§2.3). Returns both tensors.
+#[allow(clippy::too_many_arguments)]
+pub fn qk_head_norm(
+    qg: &[f32],
+    qw: &[f32],
+    kx: &[f32],
+    kw: &[f32],
+    n_qh: usize,
+    n_kh: usize,
+    d: usize,
+    q_stride: usize,
+    eps: f32,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut q = qg.to_vec();
+    let mut kk = kx.to_vec();
+    for h in 0..n_qh {
+        let base = h * q_stride;
+        let mut out = vec![0.0f32; d];
+        crate::num::rms_norm_w(&q[base..base + d], eps, qw, &mut out);
+        q[base..base + d].copy_from_slice(&out);
+    }
+    for h in 0..n_kh {
+        let base = h * d;
+        let mut out = vec![0.0f32; d];
+        crate::num::rms_norm_w(&kk[base..base + d], eps, kw, &mut out);
+        kk[base..base + d].copy_from_slice(&out);
+    }
+    (q, kk)
+}
+
+/// Pack one KV row the way `cache::KvKind` stores it (quant array, then f32 scales).
+pub fn kv_pack(kind: &str, src: &[f32]) -> Vec<u8> {
+    let nb = src.len().div_ceil(32);
+    match kind {
+        "f16" => src.iter().flat_map(|v| crate::dq::f32_to_f16(*v).to_le_bytes()).collect(),
+        "q8_0" => {
+            let mut out = vec![0u8; nb * 32];
+            for b in 0..nb {
+                let blk = &src[b * 32..(b + 1) * 32].to_vec();
+                let amax = blk.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                let sc = amax / 127.0;
+                out.extend_from_slice(&sc.to_le_bytes());
+                for (j, v) in blk.iter().enumerate() {
+                    let q = (*v / sc).round() as i32;
+                    out[b * 32 + j] = (q.clamp(-127, 127) as i8) as u8;
+                }
+            }
+            out
+        }
+        "q4_0" => {
+            let mut qs = vec![0u8; nb * 16];
+            let mut sc = Vec::new();
+            for b in 0..nb {
+                let blk = &src[b * 32..(b + 1) * 32].to_vec();
+                let amax = blk.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                let s = amax / 7.0;
+                sc.extend_from_slice(&s.to_le_bytes());
+                for j in 0..16 {
+                    let lo = (blk[2 * j] / s).round() as i32 + 8;
+                    let hi = (blk[2 * j + 1] / s).round() as i32 + 8;
+                    qs[b * 16 + j] = lo.clamp(0, 15) as u8 | ((hi.clamp(0, 15) as u8) << 4);
+                }
+            }
+            qs.extend(sc);
+            qs
+        }
+        other => panic!("no KV packing for {other}"),
+    }
+}
+
+/// Read a packed row back (the oracle for `sn_attn_decode_*`, which does the same unpacking).
+pub fn kv_unpack(kind: &str, row: &[u8], values: usize) -> Vec<f32> {
+    match kind {
+        "f16" => row[..values * 2]
+            .chunks_exact(2)
+            .map(|c| crate::dq::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        "q8_0" => {
+            let nb = values.div_ceil(32);
+            let mut out = Vec::with_capacity(values);
+            for b in 0..nb {
+                let s = f32::from_le_bytes([
+                    row[nb * 32 + b * 4],
+                    row[nb * 32 + b * 4 + 1],
+                    row[nb * 32 + b * 4 + 2],
+                    row[nb * 32 + b * 4 + 3],
+                ]);
+                for j in 0..32 {
+                    out.push((row[b * 32 + j] as i8) as f32 * s);
+                }
+            }
+            out.truncate(values);
+            out
+        }
+        "q4_0" => {
+            let nb = values.div_ceil(32);
+            let mut out = Vec::with_capacity(values);
+            for b in 0..nb {
+                let s = f32::from_le_bytes([
+                    row[nb * 16 + b * 4],
+                    row[nb * 16 + b * 4 + 1],
+                    row[nb * 16 + b * 4 + 2],
+                    row[nb * 16 + b * 4 + 3],
+                ]);
+                for j in 0..16 {
+                    let byte = row[b * 16 + j];
+                    out.push(((byte & 0xF) as f32 - 8.0) * s);
+                    out.push((((byte >> 4) & 0xF) as f32 - 8.0) * s);
+                }
+            }
+            out.truncate(values);
+            out
+        }
+        other => panic!("no KV packing for {other}"),
+    }
+}
+
+/// Causal attention for one query over the K/V rows of its own cache (§2.3), two-pass softmax as
+/// the reference forward does it.
+pub fn attn_decode(q: &[f32], ks: &[&[f32]], vs: &[&[f32]], scale: f32) -> Vec<f32> {
+    let d = q.len();
+    let mut p = vec![0.0f32; ks.len()];
+    let mut max = f32::NEG_INFINITY;
+    for (t, k) in ks.iter().enumerate() {
+        let s: f32 = q.iter().zip(k.iter()).map(|(a, b)| a * b).sum();
+        p[t] = s * scale;
+        if p[t] > max {
+            max = p[t];
+        }
+    }
+    let mut sum = 0.0f32;
+    for v in p.iter_mut() {
+        *v = (*v - max).exp();
+        sum += *v;
+    }
+    let mut out = vec![0.0f32; d];
+    for (t, p) in p.iter().enumerate() {
+        let w = p / sum;
+        for i in 0..d {
+            out[i] += w * vs[t][i];
+        }
+    }
+    out
+}
+
+/// Causal depthwise conv over the raw qkv plus SiLU (§2.4). Returns the output and the new window.
+pub fn gdn_conv_silu(qkv: &[f32], cw: &[f32], window: &[f32], d_conv: usize) -> (Vec<f32>, Vec<f32>) {
+    let ch = qkv.len();
+    let rows = d_conv - 1;
+    let mut out = vec![0.0f32; ch];
+    let mut next = vec![0.0f32; rows * ch];
+    for c in 0..ch {
+        let mut s = cw[c * d_conv + rows] * qkv[c];
+        for t in 0..rows {
+            s += cw[c * d_conv + t] * window[t * ch + c];
+            next[t * ch + c] = if t + 1 < rows { window[(t + 1) * ch + c] } else { qkv[c] };
+        }
+        out[c] = crate::num::silu(s);
+    }
+    (out, next)
+}
+
+/// L2-normalise q/k head blocks (§2.4).
+pub fn gdn_l2norm(x: &[f32], dk: usize, eps: f32) -> Vec<f32> {
+    let mut out = x.to_vec();
+    for h in 0..(x.len() / dk) {
+        crate::num::l2_norm(&mut out[h * dk..h * dk + dk], eps);
+    }
+    out
+}
+
+/// One token of the delta rule (§2.4), decay -> predict -> write -> read.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_decode_step(
+    conv: &[f32],
+    ba: &[f32],
+    ssm_a: &[f32],
+    dt_bias: &[f32],
+    state: &[f32],
+    n_v: usize,
+    d_v: usize,
+    d_k: usize,
+    n_k: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut st = state.to_vec();
+    let mut out = vec![0.0f32; n_v * d_v];
+    for h in 0..n_v {
+        let kh = h % n_k;
+        let qt = &conv[kh * d_k..kh * d_k + d_k];
+        let kt = &conv[n_k * d_k + kh * d_k..n_k * d_k + kh * d_k + d_k];
+        let vt = &conv[2 * n_k * d_k + h * d_v..2 * n_k * d_k + h * d_v + d_v];
+        let gate = ssm_a[h] * crate::num::softplus(ba[n_v + h] + dt_bias[h]);
+        let decay = gate.exp();
+        let beta = ba[h];
+        let base = h * d_v * d_k;
+        for i in 0..d_v {
+            let row = &mut st[base + i * d_k..base + (i + 1) * d_k];
+            let mut pred = 0.0f32;
+            for j in 0..d_k {
+                row[j] *= decay;
+                pred += row[j] * kt[j];
+            }
+            let delta = (vt[i] - pred) * beta;
+            for j in 0..d_k {
+                row[j] += kt[j] * delta;
+            }
+            out[h * d_v + i] = row.iter().zip(qt.iter()).map(|(a, b)| a * b).sum::<f32>() / (d_k as f32).sqrt();
+        }
+    }
+    (st, out)
+}
+
+/// The gated per-head norm on the GDN output (§2.4).
+pub fn gdn_gate_norm(core: &[f32], w: &[f32], z: &[f32], d_v: usize, eps: f32) -> Vec<f32> {
+    let mut out = vec![0.0f32; core.len()];
+    for h in 0..core.len() / d_v {
+        let base = h * d_v;
+        let mut normed = vec![0.0f32; d_v];
+        crate::num::rms_norm_w(&core[base..base + d_v], eps, w, &mut normed);
+        for i in 0..d_v {
+            out[base + i] = normed[i] * crate::num::silu(z[base + i]);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,3 +845,4 @@ mod tests {
         assert_ne!(a[8], pattern(10, 257)[8]);
     }
 }
+

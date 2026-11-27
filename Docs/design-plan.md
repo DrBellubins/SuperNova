@@ -672,7 +672,42 @@ out of the GGUF, the picks, the gates and the report; `sn gpu gemm` / `sn bench 
  column moves 463 → 814 raw / 109 → 306 fully fused (`Docs/bench.md` §2.4, §3.7). The 70 `gemv_multi_*` fusions named
  by the Phase 4 ladder are still unimplemented and counted as pending.
 
-### Phase 6 · Caches, and the first correct GPU forward (4–6 days)
+### Phase 6 · Caches, and the first correct GPU forward (4–6 days) — **running end-to-end on the GPU 2026-11-27, forward NOT yet correct**
+
+*Status (2026-11-27, in progress). What exists: `sn-hip/src/cache.rs` (`KvKind` f16/q8_0/q4_0 with a
+quant-array-then-scales row — deliberately not GGML's 34 B interleaved block, for the Phase 5 Q6_K
+reason; `CacheGeom`/`CacheLayout` reserve 14 KV + 42 GDN regions per sequence from `Plan`, sizes
+asserted against §3); `kernels/phase6.hip` (`sn_row_gather_q4_k`, `sn_qk_head_norm_f32`,
+`sn_kv_append`, `sn_attn_decode_f32` — online softmax over 8-token smem K/V tiles, GQA;
+`sn_gdn_conv_silu_f32`, `sn_gdn_l2norm_f32`, `sn_gdn_decode_f32` — one workgroup per v-head, one
+state row per thread, decay→predict→write→read, no cross-lane reduce; `sn_gdn_gate_norm_f32`,
+`sn_gdn_snapshot`); an oracle twin for each in `sn-core::oracle`; `sn-hip/src/phase6.rs` +
+`sn gpu phase6`; `decode::compile_with_caches` (the per-execution cache addresses, the Q/K head norms
+the Phase 4 count never emitted, and the GDN set as real launches); `sn-hip/src/driver.rs` (`Engine`:
+one program + one captured graph per sequence, inputs through pinned memory, `step`/`generate`);
+`sn run`; `Docs/golden/expected.tsv` (the fork's top-1 and top-8 logprobs per golden prompt).
+`ProgramSpec::build()` also now emits the pinned input nodes, which it silently dropped before.*
+
+* **Measured:** `./Tools/build-kernels.sh && ./target/debug/sn run -m <model> --golden p1-capital -n 4 --ctx 512`
+  → 916 launches/token, **10.16 t/s in a debug build**, one graph per sequence, no per-token
+  recompile (token id, position and cache length all arrive through pinned memory).
+  `sn gpu phase6 --model <model>` → **61 kernel checks, 0 failing** (GDN set ~1e-14; attention
+  correct for f16, q8_0 and q4_0 alike).
+* **NOT met yet:** `--ref-tokens 3` → logits NMSE vs the Phase 2 reference **6.1e-1 at token 1**,
+  6.8e-1 at 2, 5.9e-1 at 3 (gate 1e-4); engine top-1 for p1-capital is 369 vs the fork's 11751.
+  The error is present at position 0, where rope is a no-op and attention over one cached row is
+  exactly that row's V — so it is an integration defect (argument wiring or state hand-off), not the
+  recurrence maths: every Phase 6 kernel passes its own oracle. Suspects to bisect: the conv-window /
+  GDN state hand-off across an execution boundary, the Q/K head-norm → rope ordering as baked, the
+  mHC seed/expose as actually executed, and the `slots.cos/sin` row addressing against the
+  `token_stride` `compile` still bakes as `dm.n_q` for q (a Phase 4 review finding).
+* Not done: the `n_seq = 2` divergent-prefix gate, `crates/sn-hip/tests/phase6.rs`, `Docs/bench.md` §4,
+  and the snapshot/prefix path exercised through a real prefill (the layout and `Sessions::check_pair`
+  are implemented and unit-tested; no forward uses a snapshot yet).
+* Fusion note: `driver::launchable_fusion()` is `RAW + norm→gemv` only. `route+merge`, RoPE-in-Q/K,
+  gate-in-`wo`, SiLU-in-`ffn_down` and `gemv_multi_*` remain pending kernels, so the Phase 7 op-count
+  target (≤ 300) needs them — 916 launches today.
+
 `KVCache`: paged‑by‑block, per‑layer stride, **f16 / q8_0 / q4_0 selectable**, append‑only, positions explicit.
 `GdnState`: `[42 logical layers][n_seq][32×128×128]` f32 + conv `[8192×3]`, one contiguous slab,
 compile‑time offsets so decode needs zero indirection; **snapshot slots** per sequence at chunk boundaries

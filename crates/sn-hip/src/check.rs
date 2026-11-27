@@ -63,8 +63,10 @@ pub struct Harness<'a> {
 }
 
 /// Enough arena for the widest case (three 12288-element FFN buffers, an 8192-element stream pair,
-/// an 8x8192 router, and a two-token rope layout with a 512-wide head stride).
-pub const ARENA_BYTES: usize = 8 << 20;
+/// an 8x8192 router, and a two-token rope layout with a 512-wide head stride). Phase 6 adds the
+/// GDN state of a whole execution (32 x 128 x 128 f32 = 2 MiB) and a snapshot pair next to it, so
+/// the ceiling is sized for that.
+pub const ARENA_BYTES: usize = 32 << 20;
 
 impl<'a> Harness<'a> {
     /// Register the Phase 4 kernels, resolve the typed handles, and allocate the scratch slab.
@@ -113,6 +115,27 @@ impl<'a> Harness<'a> {
     pub fn put_f16(&self, off: usize, v: &[f32]) -> Result<()> {
         let bytes: Vec<u8> = v.iter().flat_map(|x| f32_to_f16(*x).to_le_bytes()).collect();
         self.put(off, &bytes)
+    }
+
+    /// Raw device bytes. The KV cache checks need them: a packed row is only meaningful as bytes
+    /// until it goes through `oracle::kv_unpack`.
+    pub fn put_bytes(&self, off: usize, bytes: &[u8]) -> Result<()> {
+        self.put(off, bytes)
+    }
+
+    pub fn get_bytes(&self, off: usize, n: usize) -> Result<Vec<u8>> {
+        let mut raw = vec![0u8; n];
+        hipcheck(
+            "check readback bytes",
+            self.sub.dev.api.hipMemcpy.unwrap()(
+                raw.as_mut_ptr() as *mut c_void,
+                (self.base + off as u64) as *const c_void,
+                raw.len(),
+                crate::hip::MEMCPY_DEVICE_TO_HOST,
+            ),
+            &self.sub.dev.api,
+        )?;
+        Ok(raw)
     }
 
     pub fn get_f32(&self, off: usize, n: usize) -> Result<Vec<f32>> {
