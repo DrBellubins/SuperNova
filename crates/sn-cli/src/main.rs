@@ -30,6 +30,8 @@ usage:
                                          `ops --model M [--fused|--ladder]` counts a decode step (Phase 4)
   sn bench graph [--ops N] [--reps N]      the Phase 3 graph-replay gate
   sn bench fusion [--reps N]               fused mhc_route vs the fork's node sequence (Phase 4)
+  sn gpu gemm --model M                    every GEMV/GEMM shape in the model vs sn-core's dequant (Phase 5)
+  sn bench gemm --model M [--gemm-t L]     GEMV bandwidth sweep, auto-pick table, GEMM throughput (Phase 5)
   sn gpu kernels                           every Phase 4 kernel against its scalar oracle
   sn gpu route --model M --dump DIR        the fused route vs Phase 2 stage dumps
                                          (dump with: sn ref --dump DIR --dump-only mhc.,l.,l_out.,gdn.,ffn.)
@@ -272,8 +274,10 @@ fn cmd_gpu(positional: &[String], opt_val: &impl Fn(&str) -> Option<String>) -> 
     match positional.get(1).map(|s| s.as_str()) {
         Some("kernels") => gpu::cmd_kernels(opt_val),
         Some("route") => gpu::cmd_route(positional, opt_val),
+        Some("gemm") => gpu::cmd_gemm(opt_val, false),
         _ => Ok("sn gpu kernels
 sn gpu route --model <gguf> --dump <dir> [--execs 4-11]
+sn gpu gemm  --model <gguf>
 ".into()),
     }
 }

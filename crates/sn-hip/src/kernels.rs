@@ -151,6 +151,7 @@ impl KernelRegistry {
             for (key, want) in [
                 ("sn_block", crate::ops::BLOCK),
                 ("sn_route_threads", crate::ops::ROUTE_BLOCK),
+                ("sn_gemv_block", crate::ops::GEMV_BLOCK),
             ] {
                 if let Some(got) = meta_u32(&text, key) {
                     if got != want {

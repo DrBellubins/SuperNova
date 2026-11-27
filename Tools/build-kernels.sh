@@ -54,6 +54,7 @@ for src in "$SRC"/*.hip; do
     echo "arch=${ISAS[*]}"
     echo "sn_block=$(sed -n 's/^#define SN_BLOCK  *\([0-9]*\).*/\1/p' "$src" | head -1)"
     echo "sn_route_threads=$(sed -n 's/^#define SN_ROUTE_THREADS  *\([0-9]*\).*/\1/p' "$src" | head -1)"
+    echo "sn_gemv_block=$(sed -n 's/^#define SN_GEMV_BLOCK  *\([0-9]*\).*/\1/p' "$src" | head -1)"
     echo "source=$src"
   } > "$OUT/$base.meta"
   ls -l "$OUT/$base.fatbin"

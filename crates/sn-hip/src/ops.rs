@@ -19,6 +19,12 @@ pub const BLOCK: u32 = 256;
 /// `sn_rope_inplace_*` is built for `n_pairs` threads (32 for this checkpoint), not `BLOCK`.
 pub const ROPE_BLOCK_MAX: u32 = 64;
 
+/// Workgroup size every kernel in `kernels/phase5.hip` is built for. Same reasoning as `BLOCK`:
+/// the GEMV kernels size their shared-memory reduce scratch by the *compiled* workgroup width, so
+/// `SN_GEMV_BLOCK` in the .hip and this constant must agree, and the loader refuses an image whose
+/// recorded value does not.
+pub const GEMV_BLOCK: u32 = 256;
+
 /// Threads in one `sn_mhc_route_f32` workgroup: matches `SN_ROUTE_THREADS` in the .hip. A 256-wide
 /// workgroup read the 256 KB router at ~8 GB/s; 1024 measured 2.6x faster (Docs/bench.md).
 pub const ROUTE_BLOCK: u32 = 1024;

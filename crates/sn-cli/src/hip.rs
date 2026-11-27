@@ -78,10 +78,12 @@ pub fn cmd_hip(
 pub fn cmd_bench(positional: &[String], opt_val: impl Fn(&str) -> Option<String>) -> Result<String> {
     match positional.get(1).map(|s| s.as_str()) {
         Some("fusion") => return crate::gpu::cmd_fusion(&opt_val),
+        Some("gemm") => return crate::gpu::cmd_gemm(&opt_val, true),
         Some("graph") => {}
         _ => {
             return Ok("sn bench graph  [--ops N] [--reps N] [--steps-per-op K] [--kernels PATH]
                       sn bench fusion [--reps N] [--sweeps N] [--model M]
+                      sn bench gemm   [--model M] [--reps N] [--trials N] [--read-mb N] [--gemm-t 8,64,512]
 ".into())
         }
     }

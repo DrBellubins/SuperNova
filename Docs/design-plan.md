@@ -625,17 +625,52 @@ fusion alone.** All numbers: `Docs/bench.md` §2.
   that Phase 5/6 have not written yet. `SN_TRACE` over the real step belongs to Phase 7, where the plan
   already asks for it (≤ 300 ops visible there).
 
-### Phase 5 · Quantised GEMM for Q2_K / Q4_K / f32 (5–8 days) — the bandwidth half
+### Phase 5 · Quantised matmul for Q4_K / Q6_K / f32 (5–8 days) — the bandwidth half — **kernels and gates DONE 2026-11-27, two throughput gates NOT met**
 Decode (T=1) path first: memory‑bound `gemv`, warp‑per‑superblock, `__builtin_amdgcn_` 16‑bit packed ops for the
 4/6‑bit unpack (`Q4_K` + `Q6_K` are the only quantised types in the checkpoint), 128‑byte loads, one pass, f32
 accumulate, no smem staging; block sizes tuned on gfx1102's **32 CUs** (KFD `simd_count 64 / simd_per_cu 2`,
 max clock 2208 MHz — see `Docs/baseline.md` §1) and wavefront 32.
 Prefill path: tiled GEMM with `mma.f32.f16` (RDNA3 WMMA; **no MFMA on gfx1102** — keep the CDNA `mfma` path behind a
 `cfg`/runtime arch check, don't build a kernel that can't launch here), weight tiles streamed once, dequant to f16 in smem.
-**Deliverables:** `gemv_q4k/q2k/f32`, `gemm_q4k/q2k/f32` (T up to 2048), an auto‑pick by `(T, n, k)`, a
+**Deliverables:** `gemv_q4k/q6k/f32`, `gemm_q4k/q6k/f32` (T up to 2048), an auto‑pick by `(T, n, k)`, a
 `sn bench gemm` sweep. **Feeds:** real forward passes.
 **Gate:** gemv achieves ≥ 80 % of measured device bandwidth on `ffn_down` shapes; `gemm(512)` ≥ 60 % of WMMA peak;
 NMSE ≤ 1e‑4 vs the scalar reference for all 12 GEMM shapes in the model.
+
+*Status (2026-11-27). Wording correction first: this checkpoint stores **Q4_K, Q6_K and f32** — there is no
+Q2_K (§1.2's census, and the heading said Q2_K). The kernels are `sn_gemv_{q4_k,q6_k,f32}` and
+`sn_gemm_{q4_k,q6_k,f32}` in `crates/sn-hip/kernels/phase5.hip`; `sn-hip/src/gemm.rs` holds the shape table read
+out of the GGUF, the picks, the gates and the report; `sn gpu gemm` / `sn bench gemm` run them;
+`crates/sn-hip/tests/phase5.rs` gates them.*
+
+* **NMSE ≤ 1e-4 for all 12 shapes: PASS** — 47 checks, 0 failing, worst measured NMSE **4.12e-12** (f32 summation
+ order and nothing else) against `sn-core::dq` over the checkpoint's own bytes. 12 shapes × type = 15 entries
+ (four roles mix Q4_K and Q6_K across blocks); both the `norm -> gemv` fold and the GEMM at T = 8/64/512 are
+ checked; the f32 paths have no f32 2-D weight in this file, so they are checked against a synthetic matrix and
+ labelled as such.*
+ * **GEMV ≥ 80 % of measured bandwidth on `ffn_down`: reported per quant class, because that is where the truth is.**
+ Measured device read bandwidth **280–282 GB/s**. **Q4_K: 222–239 GB/s = 79–85 %, at the gate, not reliably over it**
+ (one `uint` per lane per super-block measured 87–91; a wavefront loading four super-blocks with `uint4` + `float4`
+ activation loads got 222–244). **Q6_K: 102–108 GB/s = 36–38 %, NOT met** — a Q6_K super-block is 210 B, so no field
+ in a row is vector-aligned and unaligned vector loads on GCN are undefined, not checked (it returned NMSE 4e16, not
+ a fault). The fix is a staging decision for Phase 6: pad Q6_K super-blocks to 224 B in the weight arena (6.7 % of
+ those bytes at upload), which changes the "tensor address = base + gguf offset" contract of §1.3 and would silently
+ move the decode program's baked addresses.*
+ * **`gemm(512)` ≥ 60 % of WMMA peak: NOT EVALUABLE, and not met against any other reference either.** The WMMA
+ builtin compiles for gfx1102 (and must be `#if defined(__gfx11__)`-guarded: the fatbin is built for gfx1035 too) but
+ the probe implies 4.8e-4 ns per 16×16×16 op per wavefront — under one cycle — so its FLOP/s is not a machine peak.
+ The GEMM is plain-f32-FMA tiled (64×64×32, dequant into shared memory) and reaches **2.5–2.8 TFLOP/s = 31–34 % of the
+ measured 8.0–8.2 TFLOP/s f32 FMA peak**. Compute-bound above T ≈ 64, limited by the one-value-per-index fill; Phase 8
+ should block-dequant 16 values per load into the tile and Phase 5's WMMA item stays open behind a correct microkernel
+ (fragment-layout probes matched nothing: NMSE 1.9–2.4).*
+ * **Auto-pick: implemented and measured against a sweep, not asserted.** `pick_warps` splits K for narrow matrices
+ (`ssm_beta_alpha`, 64 rows: 16 → 25 GB/s) and never splits wide ones; `pick_path` sends T = 1 to the GEMV and
+ T ≥ 8 to the GEMM. The sweep agrees with the pick within 5 % on 11 of 14 shapes and is 3–8 % better on three
+ (within §2.3's clock-state spread) — reported as not-met rather than smoothed.*
+ * **Feeds Phase 7:** the decode program's 267 weight multiplications are launchable now, with `warps_per_row` as an
+ argument and the grid derived from the policy (asserted structurally in `tests/phase5.rs`); the ladder's launchable
+ column moves 463 → 814 raw / 109 → 306 fully fused (`Docs/bench.md` §2.4, §3.7). The 70 `gemv_multi_*` fusions named
+ by the Phase 4 ladder are still unimplemented and counted as pending.
 
 ### Phase 6 · Caches, and the first correct GPU forward (4–6 days)
 `KVCache`: paged‑by‑block, per‑layer stride, **f16 / q8_0 / q4_0 selectable**, append‑only, positions explicit.

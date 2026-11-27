@@ -94,6 +94,100 @@ pub fn cmd_route(positional: &[String], opt_val: &dyn Fn(&str) -> Option<String>
     Ok(out)
 }
 
+/// `sn gpu gemm` / `sn bench gemm`: the Phase 5 matmul surface.
+///
+/// One command does both halves because they share the only expensive setup - copying the
+/// checkpoint's own weight bytes into a device slab, so the numbers are the model's shapes and the
+/// model's quantisation mix rather than a fixture's. `sn gpu gemm` is the correctness gate alone
+/// (what a test runs); `sn bench gemm` additionally measures the device references (read
+/// bandwidth, f32-FMA peak, WMMA peak), sweeps every legal `warps_per_row` for every shape, and
+/// times the prefill GEMM - the two Phase 5 gates and the auto-pick evidence in one run.
+pub fn cmd_gemm(opt_val: &impl Fn(&str) -> Option<String>, bench: bool) -> Result<String> {
+    let num = |name: &str, d: usize| -> Result<usize> {
+        match opt_val(name) {
+            None => Ok(d),
+            Some(v) => v.parse::<usize>().map_err(|e| sn_core::Error::msg(format!("{name}: {e}"))),
+        }
+    };
+    let path = opt_val("--model").ok_or_else(|| sn_core::Error::msg("gemm needs --model <gguf>"))?;
+    let g = Gguf::open(&path)?;
+    let plan = Plan::build(Hyperparams::from_gguf(&g)?)?;
+    let sub = Substrate::open()?;
+    let mut reg = KernelRegistry::new();
+    for p in sn_hip::bench::image_paths() {
+        reg.add_image(&sub.dev, &p)?;
+    }
+    let n5 = sn_hip::gemm::register_phase5(&sub.dev, &mut reg)?;
+    let p5 = sn_hip::gemm::Phase5::resolve(&reg)?;
+
+    let shapes = sn_hip::gemm::model_shapes(&g, &plan)?;
+    let roles = shapes.iter().filter(|s| !s.variant).count();
+    let mut out = format!(
+        "{}\nmodel: {}\nplan: {} blocks, n_embd = {}\n{} Phase 5 kernels registered\n{} GEMM roles in the model ({} entries: a role that uses two quant classes is gated in both)\n",
+        sub.dev.info,
+        path,
+        plan.n_layer,
+        plan.hp.n_embd,
+        n5,
+        roles,
+        shapes.len()
+    );
+    let mut tok_bytes = 0usize;
+    for s in &shapes {
+        out += &format!(
+            "  {:<26} {:>13} {:>6} {:>12} B x{:>2} = {:>12} B/token{}\n",
+            s.role,
+            s.key(),
+            s.type_name,
+            s.bytes,
+            s.visits,
+            s.bytes_per_token(),
+            if s.variant { "  (variant)" } else { "" }
+        );
+        tok_bytes += s.bytes_per_token();
+    }
+    out += &format!("  weight bytes per decoded token (these shapes): {tok_bytes}\n");
+
+    let tmax = num("--gemm-max-t", 512)?;
+    // Enough for a T = tmax activation and output of the widest model shape, and at least 256 MB so
+    // the read-bandwidth reference runs over something far bigger than the 32 MB L2 (`--read-mb`
+    // lowers it; `measure_machine` clamps to what is actually allocated).
+    let scratch = (2 * tmax * 12288 * 4).max(256 << 20);
+    let weight_bytes: usize = shapes.iter().map(|s| s.bytes).sum();
+    out += &format!("\nuploading {weight_bytes} B of the model's own weights, {scratch} B scratch ...\n");
+    let t = sn_hip::program::Timer::new(&sub.dev)?;
+    t.begin(&sub.dev, sub.stream)?;
+    let mut ws = sn_hip::gemm::upload_shapes(&g, &sub.dev, &shapes, scratch)?;
+    out += &format!("  uploaded in {:.2} s\n", t.end_ms(&sub.dev, sub.stream)? / 1e3);
+
+    let d1 = reg.find("dbg_q4k_lane", &[], sn_hip::kernels::DType::Any).cloned();
+    let d2 = reg.find("dbg_args", &[], sn_hip::kernels::DType::Any).cloned();
+    let mut checks = sn_hip::gemm::gemm_checks(&p5, &g, &mut ws, &shapes, &plan, &sub.dev, sub.stream, d1.as_ref(), d2.as_ref())?;
+    // The f32 kernels are gated too, against a synthetic matrix: this checkpoint has no f32 2-D
+    // weights, and an untested kernel is a worse answer than a synthetic test.
+    checks.extend(sn_hip::gemm::f32_checks(&p5, &mut ws, &sub.dev, sub.stream, &plan)?);
+    out += "\ncorrectness against sn_core::dq (the reference Phase 2 matched GGML's C with), same bytes\n";
+    out += &check::report(&checks);
+    let fails = checks.iter().filter(|c| !c.ok()).count();
+    if !bench {
+        return Ok(format!("{out}\n{} checks, {fails} failing\n", checks.len()));
+    }
+
+    let reps = num("--reps", 20)?.max(1);
+    let trials = num("--trials", 3)?.max(1);
+    let read_bytes = num("--read-mb", 256)?.max(16) << 20;
+    let ts: Vec<usize> = match opt_val("--gemm-t") {
+        Some(v) => v.split(',').filter_map(|x| x.trim().parse::<usize>().ok()).filter(|x| *x > 0).collect(),
+        None => vec![8, 64, 256, 512],
+    };
+    let machine = sn_hip::gemm::measure_machine(&p5, &sub.dev, sub.stream, &ws.scratch, read_bytes)?;
+    let rows = sn_hip::gemm::gemv_sweep(&p5, &sub.dev, sub.stream, &mut ws, &shapes, &plan, reps, trials)?;
+    let gemms = sn_hip::gemm::gemm_table(&p5, &sub.dev, sub.stream, &mut ws, &shapes, &ts, reps, trials, &machine)?;
+    out += "\n";
+    out += &sn_hip::gemm::gemm_report(&rows, &gemms, &machine, &[]);
+    Ok(format!("{out}\ncorrectness: {} checks, {fails} failing\n", checks.len()))
+}
+
 /// `sn bench fusion`: the fused route against the fork's node sequence.
 pub fn cmd_fusion(opt_val: &dyn Fn(&str) -> Option<String>) -> Result<String> {
     let num = |name: &str, d: usize| -> Result<usize> {

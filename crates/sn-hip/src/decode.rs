@@ -753,8 +753,14 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// One weight matrix, one launch. The trailing two arguments are the folded-in pre-norm
-    /// (`norm_w = 0` when the norm is a separate launch) and its epsilon: the Phase 5 GEMV ABI.
+    /// One weight matrix, one launch. The trailing arguments are the folded-in pre-norm
+    /// (`norm_w = 0` when the norm is a separate launch), its epsilon, and `warps_per_row`: the
+    /// Phase 5 GEMV ABI, with the geometry the plan says is a per-shape tuning decision.
+    ///
+    /// Phase 5 owns `gemv_q4_k` / `gemv_q6_k` / `gemv_f32`, so a tensor of one of those three
+    /// types is no longer reported pending: `ProgramSpec::build` launches it. Any other element
+    /// type stays pending, which is the honest answer for a checkpoint this engine has not been
+    /// built for (§1.2: this file stores Q4_K, Q6_K and f32 only).
     #[allow(clippy::too_many_arguments)]
     fn gemv(&mut self, label: &str, tensor: &str, x: usize, y: usize, k: usize, n: usize, fold_norm: Option<&str>, blk: usize) -> Result<()> {
         let _ = blk;
@@ -763,15 +769,17 @@ impl<'a> Builder<'a> {
             Some(name) => self.w(name)?,
             None => Arg::U64(0),
         };
+        let wpr = crate::gemm::pick_warps(n, k, crate::gemm::PICK_CUS);
+        let have = matches!(ty.as_str(), "q4_k" | "q6_k" | "f32");
         self.push(
             label,
             "gemv",
             &format!("gemv_{ty}"),
-            true,
-            [1, 1, 1],
-            BLOCK,
+            !have,
+            crate::gemm::gemv_grid(n, wpr),
+            crate::ops::GEMV_BLOCK,
             0,
-            vec![self.w_off(off), self.a(x), self.a(y), i(k), i(n), norm_w, Arg::F32(self.rms_eps)],
+            vec![self.w_off(off), self.a(x), self.a(y), i(k), i(n), norm_w, Arg::F32(self.rms_eps), i(wpr)],
         );
         Ok(())
     }

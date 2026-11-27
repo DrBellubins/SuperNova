@@ -244,14 +244,23 @@ The plan asks for ≤ 300 nodes per decode step. With every Phase 4 fusion turne
 still needs **669** (raw, one kernel per step of §2: **1011**):
 
 ```
-raw (one kernel per step of §2):  1011 launches ( 463 launchable today)
-+ norm -> gemv:   899 launches ( 351)  -112
-+ silu -> gemv:   843 launches ( 295)  -56
-+ multi-gemv:   759 launches ( 295)  -84
-+ rope -> gemv:   731 launches ( 267)  -28
-+ gate -> gemv:   717 launches ( 253)  -14
-+ route+merge (= P2 target):   669 launches ( 109)  -48
+raw (one kernel per step of §2):  1011 launches ( 814 launchable today)
++ norm -> gemv:   899 launches ( 702)  -112
++ silu -> gemv:   843 launches ( 646)  -56
++ multi-gemv:   759 launches ( 492)  -84
++ rope -> gemv:   731 launches ( 464)  -28
++ gate -> gemv:   717 launches ( 450)  -14
++ route+merge (= P2 target):   669 launches ( 306)  -48
 ```
+
+*(Numbers re-taken after **Phase 5** on 2026-11-27; the launchable column is what changed, the op
+counts are the same. Phase 4 recorded 463 / 109. Every `gemv_q4_k`, `gemv_q6_k`, `gemv_f32` node is
+now a real launch with a geometry derived from `gemm::pick_warps` (§3.3), which removes 351 pending
+names from the raw program and 197 from the fully fused one — 70 of the fully fused program's GEMV
+nodes are `gemv_multi_qkv` / `gemv_multi_gate_up`, fusions that reduce the *count* but are not
+implemented, and `tests/phase5.rs` asserts that those are the only GEMV names still pending. What
+remains pending is 154 GDN recurrent kernels and the Phase 6 elementwise set: `rope_tables`,
+`row_gather_f32`, `causal_index`, `norm_bands`, `rope_bands`, `gdn_gate_norm`.)*
 
 and 669 breaks down as `gemv 267, recur 154, merge 98, route 48, gate 42, silu 42, add 16, input 1,
 norm 1` — i.e. 267 weight matrices (irreducible: one per matrix, and `multi_gemv` already batched what
@@ -317,3 +326,171 @@ than drifting.
 * `crates/sn-hip/src/check.rs` — `Harness`, `kernel_checks`, `route_vs_golden`, `fusion_gate`, `report`.
 * `crates/sn-cli/src/gpu.rs` — `sn gpu kernels`, `sn gpu route`, `sn bench fusion`, `sn hip ops`.
 * `crates/sn-hip/tests/{phase4.rs,phase4_fusion.rs,common/mod.rs}`, `Tools/kernel-check.py`.
+
+---
+
+## 3. Phase 5 — the quantised matmul surface (2026-11-27)
+
+### 3.0 The commands
+
+```sh
+./Tools/build-kernels.sh                                 # crates/sn-hip/kernels/phase5.hip -> target/hip/phase5.fatbin
+./target/release/sn gpu gemm  --model $M                 # correctness of every shape in the checkpoint
+./target/release/sn bench gemm --model $M [--reps 10] [--trials 3] [--gemm-t 8,64,256,512] [--read-mb 256]
+cargo test -p sn-hip --test phase5                       # the same correctness gate as a test
+```
+
+`supernova` in the scratchpad sense: both commands read the **checkpoint's own weight bytes** into a
+device slab and multiply *those*, so the numbers belong to the model's shapes and its real
+quantisation mix (design-plan §1.2), not to a fixture. `sn gpu gemm` uploaded 1 648 361 472 B of
+weights in 0.19 s (8.7 GB/s, PCIe-bound — Phase 6 should stage in pinned chunks, same note as §1.3).
+
+The 12 GEMM roles became **15 shape/type entries**, because four roles use two quantisation classes
+across blocks (`attn_qkv_gate`, `ffn_down`, `attn_v` are Q4_K on some blocks and Q6_K on others).
+Both classes are gated; neither kernel is validated by the other. `nextn.eh_proj` is a 13th shape and
+belongs to Phase 9. Weight traffic through these shapes: **1 707 343 872 B per decoded token**
+(834 MB of it the Q6_K output head, 572 MB the Q4_K embedding — which decode *gathers*, so it is
+checked as a matmul but never timed as one).
+
+### 3.1 Correctness — 47 checks, 0 failing, worst NMSE 4.12e-12 (`sn gpu gemm`)
+
+Gate 1e-4, measured 4.12e-12 (`gemm … ffn_down … T=512`); the GEMV worst is 5.88e-13. That is f32
+summation order and nothing else — the reference is `sn_core::dq` (the reader Phase 2 matched
+against GGML's C with `Tools/dequant_ref.py`, §2.9) run over the same bytes.
+
+Covered: every shape × {plain, `norm -> gemv` folded} = 30 GEMV checks; `ffn_down` and
+`attn_qkv_gate` × both classes × T ∈ {8, 64, 512} = 12 GEMM checks (at T = 512 the scalar reference
+re-dequantises the matrix per activation column, so every 8th column is scored — a stride that still
+lands in every T tile of the kernel's grid; T = 8 and 64 are scored in full); and 5 checks for the
+**f32** paths against a synthetic matrix, because §1.2's census says this checkpoint has no f32 2-D
+weights — an untested kernel is a worse answer than a synthetic test.
+
+### 3.2 Measured device references, and GEMV bandwidth
+
+```
+read bandwidth   280.2–281.8 GB/s over 268435456 B      (sn_read_bw, float4, ≫ the 32 MB L2)
+f32 FMA peak     8.0–8.2 TFLOP/s                        (8 independent FMAs per thread)
+```
+
+The read reference is at the interface's spec for this card (128-bit GDDR6 at 18 Gbps ≈ 288 GB/s),
+which is what makes it a usable denominator. `gemv >= 80 % of measured device bandwidth on
+ffn_down shapes` — reported **per quantisation class**, because the two classes are limited by
+different things and one blended number hid it:
+
+| class | ffn_down GEMV | % of measured bandwidth | verdict |
+|---|---|---|---|
+| Q4_K | 222.6 – 239.4 GB/s | 79.4 – 84.9 % | at the gate, not reliably over it |
+| Q6_K | 101.7 – 108.0 GB/s | 36.3 – 37.9 % | **NOT met** |
+
+(the spread is two runs of the same command; §2.3's bimodal clock states are real and move a shape
+by ~7 %, which is also why 79.4 % and 84.9 % are the same result.)
+
+Per shape, best measured (`--reps 10 --trials 3`, GB/s at the picked geometry): Q4_K
+`ffn_down` 239 / `attn_qkv_gate` 231 / `ffn_gate` 227 / `attn_q` 217 / `ssm_out` 191 / `attn_k` 148 /
+`ssm_beta_alpha` 25 (64 rows: 25 GB/s is 99 % of what 64 rows can move, see §3.3); Q6_K
+`attn_v` 114 / `output` 108 / `ffn_down` 108 / `attn_qkv_gate` 107.
+
+**Why Q4_K got there and Q6_K did not.** The first Q4_K kernel read one `uint` (4 B) per lane per
+super-block and measured 87–91 GB/s; its *per-element* rate matched Q6_K's despite carrying 1.46×
+more values per byte, which says the limit was load instructions and memory latency, not DRAM. Two
+changes took it to 222–244 GB/s: a wavefront loading **four super-blocks per iteration** with a
+`uint4` per lane (512 B, 32 row values per lane instead of 8, one load instead of six), and
+`float4` activation loads instead of scalar ones. Correctness was re-gated after each step.
+
+Q6_K cannot use that path in the current staging: a Q6_K super-block is **210 bytes**, so successive
+rows start at offsets that are only 2-byte aligned and no field inside a row is vector-aligned. The
+attempt produced wrong answers (NMSE 4e16) rather than a fault — unaligned vector loads on GCN are
+undefined, not checked. The fix is a *staging* decision, not a kernel one: lay Q6_K super-blocks out
+padded to 224 B in the weight arena (Phase 6), which leaves every field at its existing offset and
+costs 6.7 % of the Q6_K bytes at upload time. Recorded as the follow-up rather than done here,
+because it changes the contract `sn hip info --weights` documents in §1.3 (tensor address =
+base + gguf offset) and would silently break the decode program's baked weight addresses.
+
+### 3.3 The auto-pick, and the sweep that checks it
+
+`gemm::pick_warps(n, k, cus)` splits one output row across `warps_per_row` wavefronts so a narrow
+matrix can still fill the machine (`n · wpr ≥ 16 · CU` wavefronts, capped by the K axis and by
+`SN_GEMV_BLOCK/32 = 8`), and `pick_path` sends `T = 1` to the GEMV, `T ≥ 8` to the tiled GEMM, and
+1 < T < 8 to the GEMV per token. `sn bench gemm` prints, for every shape, the whole sweep over
+wpr ∈ {1,2,4,8} next to the pick:
+
+* wide shapes want `wpr = 1` and the policy picks it — for Q4_K the sweep's own ordering is
+  1 > 2 > 4 > 8 (e.g. ffn_down 223 / 194 / 204 / 173), so splitting a 4096-row matrix only adds a
+  shared-memory reduce;
+* `ssm_beta_alpha` (64 rows) is the opposite: 15.8 GB/s at wpr=1 → 15.8–18 at wpr=4/8, and the
+  policy picks 4. 25 GB/s looks like a failure until you divide: 147 KB of weights is *below the
+  launch cost*, and this tensor is read once per token in a 1.7 GB/token loop — it is 0.009 % of the
+  traffic. The honest claim is "the narrow tensor is no longer a stall", not "it is fast";
+* 3 of 14 shapes measured a wpr the policy does not pick by more than 5 % (e.g. `ssm_out` 166 vs
+  180 at wpr=2) — within the run-to-run spread of §2.3, but not evidence that the policy is
+  optimal. The gate "the pick is the sweep's best" is therefore reported as **not met**, with the
+  differences listed rather than averaged away.
+
+### 3.4 Prefill GEMM — 2.6 TFLOP/s = 34 % of the measured FMA peak
+
+The tiled kernel is 64×64×32, dequantising weights into shared memory and accumulating with **plain
+f32 FMAs** (there is no f16 MMA path in this phase; see §3.5). At the sizes the plan's gate names:
+
+| shape | T | GFLOP | ms | GFLOP/s | % of measured FMA peak |
+|---|---|---|---|---|---|
+| `ffn_gate` 12288×4096 | 512 | 51.5 | 19.6 | 2 631 | 32.1 % |
+| `ffn_down` 4096×12288 | 512 | 51.5 | 20.6 | 2 505 | 31.3 % |
+| `attn_qkv_gate` 12288×4096 | 512 | 51.5 | 20.0 | 2 576 | 32.2 % |
+| `attn_qkv_gate` [q6_k] | 512 | 51.5 | 23.3 | 2 216 | 27.0 % |
+| `attn_k` 1024×4096 | 256 | 2.1 | 0.78 | 2 763 | 34.5 % |
+
+`gemm(512) >= 60 % of WMMA peak`: **NOT EVALUABLE** (§3.5). Against the reference this kernel is
+actually written against — the measured 8.0–8.2 TFLOP/s f32 FMA peak — it reaches **34.2 %**, so the
+60 % gate is not met either way. What the numbers do show is that the kernel is compute-bound above
+T ≈ 64 (1.9–2.8 TFLOP/s flat across 64/256/512, i.e. weight traffic is no longer the limit) and that
+the dequantise-into-shared-memory fill is where the remaining factor sits: a Q4_K fill decodes one
+value per (row, k) index, which is the right thing for correctness and the wrong thing for
+throughput. Phase 8 should replace the fill with a block-dequant that decodes 16 values per load,
+the same step that took the GEMV from 90 to 230 GB/s.
+
+### 3.5 The WMMA probe measured something, but it is not a peak
+
+`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` compiles for gfx1102 and runs. It is also gated on
+`wmma-256b-insts` + wavefrontsize32, so the same image must guard it (`#if defined(__gfx11__)`) —
+this box builds the fatbin for gfx1035 too, and the unguarded builtin fails to compile for it. The
+dependent-chain probe reports 1.7–3.2e16 FLOP/s, which implies **4.8e-4 ns of device time per
+16×16×16 op per wavefront** — under one cycle at any clock this card runs at, so the loop is not
+executing one matrix operation per iteration in any sense worth dividing by. The report and the gate
+say `NOT EVALUABLE` rather than quoting 17 PFLOP/s as a machine peak. Phase 5 therefore has **no
+f16 MMA path**; it needs a real tiled WMMA microkernel whose output is correct first (the fragment
+layout probes in the planning session did not match the oracle, NMSE 1.9–2.4) and whose throughput is
+measured second. Until then the GEMM's reference is the measured f32 FMA peak above.
+
+### 3.6 Two bugs that produced wrong numbers silently
+
+1. **A two-stage reduce with the first stage missing.** `sn_row_group_sum` wrote only lane 0's
+   partial to shared memory, so a row's answer was "whatever lane 0 read": every shape returned
+   NMSE ≈ 1.0, and the tell was a one-hot activation — only indices ≡ 0…3 (mod 32) came back
+   non-zero, which is exactly lane 0's slice. Fix: fold the wavefront (`sn_wave_sum`) *before* the
+   shared-memory step. Same class as §2.5: a wrong value with plausible magnitude and no error.
+2. **A shared-memory tile with the wrong pitch.** The activation tile is 64 tokens wide but was
+   declared with the 33-float pitch of the 32-wide weight tile, so each row wrote into its
+   neighbour's. Tell: T = 8 was *partly* right (NMSE 6e-3) while T = 64/512 were not (≈0.97) — a
+   small T leaves most of the tile unexercised, so a small-T-only test would have passed. Two
+   pitches (`SN_PADK 33`, `SN_PADT 65`) and both are exercised at every T.
+
+Debugging tools that paid for themselves and stayed in the image (only run under `SN_DEBUG`):
+`sn_dbg_q4k_lane` (per-lane partials, one row, no split — shows *which* lane owns which element) and
+`sn_dbg_args` (writes its own arguments back, which is how "the ABI is fine, the kernel isn't" was
+established instead of assumed). `SN_GEMM_ONLY=<role>` and `SN_WPR=<n>` narrow the check harness to
+one shape and one geometry.
+
+### 3.7 What Phase 5 is (files)
+
+* `crates/sn-hip/kernels/phase5.hip` — `sn_gemv_{q4_k,q6_k,f32}` (wide-load Q4_K, byte-load Q6_K,
+  folded-norm variant), `sn_gemm_{q4_k,q6_k,f32}` (64×64×32 tiled, shared-memory dequant), the
+  `sn_read_bw` / `sn_peak_fma_f32` / `sn_peak_wmma` references, and the two debug probes.
+  `SN_GEMV_BLOCK 256` is recorded in `target/hip/phase5.meta` and `KernelRegistry::add_image`
+  refuses an image whose value disagrees with `ops::GEMV_BLOCK` (the §2.5 guard, extended).
+* `crates/sn-hip/src/gemm.rs` — the shape table read out of the GGUF (`model_shapes`), the picks
+  (`pick_warps`, `pick_path`, `gemv_grid`), the correctness harness (`gemm_checks`, `f32_checks`),
+  the bandwidth sweep and throughput tables, the gates and the report, the policy unit tests.
+* `decode.rs` no longer reports `gemv_q4_k` / `gemv_q6_k` / `gemv_f32` as pending: the decode step's
+  weight multiplications are launchable, with `warps_per_row` as an argument and the grid derived
+  from the same policy (asserted in `tests/phase5.rs`).
+* `sn gpu gemm`, `sn bench gemm` (`sn-cli`).
